@@ -1,0 +1,8 @@
+proxy:
+  listen_address: "127.0.0.1:8080"
+  tls:
+    ca_dir: "~/.bulwark/ca"
+
+logging:
+  format: json
+  level: info

@@ -1,0 +1,23 @@
+[package]
+name = "bulwark-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bulwark CLI entry point"
+
+[[bin]]
+name = "bulwark"
+path = "src/main.rs"
+
+[dependencies]
+bulwark-common.workspace = true
+bulwark-config.workspace = true
+bulwark-proxy.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde_yaml.workspace = true
+dirs.workspace = true
