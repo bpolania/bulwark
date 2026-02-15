@@ -25,6 +25,10 @@ use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
+use bulwark_audit::event::{
+    AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
+};
+use bulwark_audit::logger::AuditLogger;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -40,6 +44,7 @@ pub async fn handle_connect(
     tls_state: Arc<TlsState>,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // Extract the target host:port from the CONNECT URI.
     let target_authority = match req.uri().authority() {
@@ -86,6 +91,7 @@ pub async fn handle_connect(
     let target_authority_clone = target_authority.clone();
     let policy_engine_clone = policy_engine;
     let vault_clone = vault;
+    let audit_clone = audit_logger;
 
     tokio::spawn(async move {
         // Wait for the HTTP upgrade to complete.
@@ -105,6 +111,7 @@ pub async fn handle_connect(
             tls_state_clone,
             policy_engine_clone,
             vault_clone,
+            audit_clone,
         )
         .await
         {
@@ -125,6 +132,7 @@ pub async fn handle_connect(
 
 /// Perform the TLS MITM: accept TLS from the client, connect TLS to the
 /// server, and proxy decrypted HTTP between them.
+#[allow(clippy::too_many_arguments)]
 async fn mitm_tunnel(
     upgraded: hyper::upgrade::Upgraded,
     target_host: &str,
@@ -133,6 +141,7 @@ async fn mitm_tunnel(
     tls_state: Arc<TlsState>,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
 ) -> bulwark_common::Result<()> {
     // --- Client-side TLS (we are the "server" to the client) ---
     let server_config = ServerConfig::builder()
@@ -175,7 +184,8 @@ async fn mitm_tunnel(
         let connector = tls_state.server_connector.clone();
         let policy = policy_engine.clone();
         let vault = vault.clone();
-        async move { forward_tls_request(req, &host, port, connector, policy, vault).await }
+        let audit = audit_logger.clone();
+        async move { forward_tls_request(req, &host, port, connector, policy, vault, audit).await }
     });
 
     let conn = http1::Builder::new()
@@ -198,6 +208,7 @@ async fn forward_tls_request(
     connector: TlsConnector,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -461,6 +472,16 @@ async fn forward_tls_request(
         }
     };
 
+    // Build audit session info if available.
+    let audit_session = session.as_ref().map(|s| SessionInfo {
+        session_id: s.id.clone(),
+        operator: s.operator.clone(),
+        team: s.team.clone(),
+        project: s.project.clone(),
+        environment: s.environment.clone(),
+        agent_type: s.agent_type.clone(),
+    });
+
     match sender.send_request(outbound).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -484,6 +505,24 @@ async fn forward_tls_request(
                 None,
             );
 
+            // Emit audit event.
+            if let Some(ref logger) = audit_logger {
+                let mut builder =
+                    AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
+                        .outcome(EventOutcome::Success)
+                        .request(RequestInfo {
+                            tool: host.clone(),
+                            action: method.to_string(),
+                            resource: None,
+                            target: url.clone(),
+                        })
+                        .duration_us(start.elapsed().as_micros() as u64);
+                if let Some(ref si) = audit_session {
+                    builder = builder.session(si.clone());
+                }
+                logger.log(builder.build());
+            }
+
             let body = Full::new(resp_bytes)
                 .map_err(|never| match never {})
                 .boxed();
@@ -502,6 +541,29 @@ async fn forward_tls_request(
                 true,
                 Some(e.to_string()),
             );
+
+            // Emit audit event for failed request.
+            if let Some(ref logger) = audit_logger {
+                let mut builder =
+                    AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
+                        .outcome(EventOutcome::Failed)
+                        .request(RequestInfo {
+                            tool: host.clone(),
+                            action: method.to_string(),
+                            resource: None,
+                            target: url.clone(),
+                        })
+                        .error(bulwark_audit::event::ErrorInfo {
+                            category: "upstream".to_string(),
+                            message: e.to_string(),
+                        })
+                        .duration_us(start.elapsed().as_micros() as u64);
+                if let Some(ref si) = audit_session {
+                    builder = builder.session(si.clone());
+                }
+                logger.log(builder.build());
+            }
+
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream error: {e}"),

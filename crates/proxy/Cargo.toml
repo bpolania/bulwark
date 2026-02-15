@@ -11,6 +11,7 @@ bulwark-common.workspace = true
 bulwark-config.workspace = true
 bulwark-policy.workspace = true
 bulwark-vault.workspace = true
+bulwark-audit.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true

@@ -23,6 +23,8 @@ pub struct BulwarkConfig {
     pub policy: PolicyConfig,
     /// Vault settings.
     pub vault: VaultConfig,
+    /// Audit settings.
+    pub audit: AuditConfig,
 }
 
 /// Configuration for the proxy listener.
@@ -158,6 +160,28 @@ impl Default for VaultConfig {
             bindings_path: "~/.bulwark/bindings.yaml".to_string(),
             sessions_db_path: "~/.bulwark/sessions.db".to_string(),
             require_sessions: false,
+        }
+    }
+}
+
+/// Audit logging configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Path to the audit database.
+    pub db_path: String,
+    /// Whether audit logging is enabled.
+    pub enabled: bool,
+    /// Retention period in days (0 = no retention, keep everything).
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            db_path: "~/.bulwark/audit.db".to_string(),
+            enabled: true,
+            retention_days: 90,
         }
     }
 }

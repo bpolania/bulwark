@@ -280,12 +280,24 @@ dependencies = [
 [[package]]
 name = "bulwark-audit"
 version = "0.1.0"
+dependencies = [
+ "bulwark-common",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "bulwark-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
  "bulwark-mcp",
@@ -298,6 +310,7 @@ dependencies = [
  "parking_lot",
  "rpassword",
  "secrecy",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tokio-util",
@@ -331,6 +344,7 @@ version = "0.1.0"
 name = "bulwark-mcp"
 version = "0.1.0"
 dependencies = [
+ "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
  "bulwark-policy",
@@ -369,6 +383,7 @@ dependencies = [
 name = "bulwark-proxy"
 version = "0.1.0"
 dependencies = [
+ "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
  "bulwark-policy",

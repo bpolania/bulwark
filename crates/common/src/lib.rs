@@ -33,6 +33,10 @@ pub enum BulwarkError {
     #[error("vault error: {0}")]
     Vault(String),
 
+    /// An audit-related error.
+    #[error("audit error: {0}")]
+    Audit(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

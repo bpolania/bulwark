@@ -10,6 +10,7 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use bulwark_audit::logger::AuditLogger;
 use bulwark_config::ProxyConfig;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
@@ -25,6 +26,7 @@ pub struct ProxyServer {
     start_time: Instant,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
 }
 
 impl ProxyServer {
@@ -41,6 +43,7 @@ impl ProxyServer {
             start_time: Instant::now(),
             policy_engine: None,
             vault: None,
+            audit_logger: None,
         })
     }
 
@@ -53,6 +56,12 @@ impl ProxyServer {
     /// Attach a vault for session validation and credential injection.
     pub fn with_vault(mut self, vault: Arc<parking_lot::Mutex<Vault>>) -> Self {
         self.vault = Some(vault);
+        self
+    }
+
+    /// Attach an audit logger for event logging.
+    pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
+        self.audit_logger = Some(logger);
         self
     }
 
@@ -147,13 +156,17 @@ impl ProxyServer {
         let start_time = self.start_time;
         let policy_engine = self.policy_engine.clone();
         let vault = self.vault.clone();
+        let audit_logger = self.audit_logger.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let tls = Arc::clone(&tls_state);
                 let policy = policy_engine.clone();
                 let vault = vault.clone();
-                async move { handler::handle_request(req, addr, tls, start_time, policy, vault).await }
+                let audit = audit_logger.clone();
+                async move {
+                    handler::handle_request(req, addr, tls, start_time, policy, vault, audit).await
+                }
             });
 
             let builder = Builder::new(TokioExecutor::new());

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bulwark_audit::logger::AuditLogger;
 use bulwark_config::{LogFormat, load_config};
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_proxy::server::ProxyServer;
@@ -52,6 +53,7 @@ pub fn start(
     let policies_dir = config.policy.policies_dir.clone();
 
     let vault_config = config.vault.clone();
+    let audit_config = config.audit.clone();
 
     rt.block_on(async {
         let mut server = ProxyServer::new(config.proxy)
@@ -93,6 +95,52 @@ pub fn start(
             }
         }
 
+        // Start audit logger if enabled.
+        let audit_logger = if audit_config.enabled {
+            let audit_db_path = bulwark_config::expand_tilde(&audit_config.db_path);
+            match AuditLogger::new(Path::new(&audit_db_path)) {
+                Ok(logger) => {
+                    tracing::info!(db = %audit_db_path, "audit logger started");
+
+                    // Run retention cleanup on startup.
+                    if audit_config.retention_days > 0 {
+                        match bulwark_audit::store::AuditStore::open(Path::new(&audit_db_path)) {
+                            Ok(retention_store) => {
+                                match bulwark_audit::retention::run_retention(
+                                    &retention_store,
+                                    audit_config.retention_days,
+                                ) {
+                                    Ok(deleted) if deleted > 0 => {
+                                        tracing::info!(
+                                            deleted = deleted,
+                                            days = audit_config.retention_days,
+                                            "audit retention cleanup on startup"
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "audit retention cleanup failed");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to open audit store for retention");
+                            }
+                        }
+                    }
+
+                    server = server.with_audit_logger(logger.clone());
+                    Some(logger)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start audit logger");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let shutdown_token = server.shutdown_token();
 
         // Listen for SIGINT / SIGTERM.
@@ -103,6 +151,12 @@ pub fn start(
         });
 
         server.run().await.context("running proxy server")?;
+
+        // Flush and shut down audit logger.
+        if let Some(logger) = audit_logger {
+            logger.shutdown().await;
+        }
+
         Ok(())
     })
 }

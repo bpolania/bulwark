@@ -60,6 +60,11 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Query and manage the audit log.
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -127,6 +132,55 @@ enum CredAction {
         /// Session token.
         #[arg(long)]
         session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Search audit events.
+    Search {
+        /// Filter by event type (e.g. request_processed, policy_decision).
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Filter by outcome (e.g. success, denied, failed).
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Filter by operator name.
+        #[arg(long)]
+        operator: Option<String>,
+        /// Filter by tool name (supports * wildcard).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Show events since (e.g. 1h, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of results.
+        #[arg(long, default_value = "50")]
+        limit: Option<usize>,
+    },
+    /// Show the most recent audit events.
+    Tail {
+        /// Number of events to show.
+        #[arg(default_value = "20")]
+        count: usize,
+    },
+    /// Show aggregate audit statistics.
+    Stats {
+        /// Show stats since (e.g. 1h, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Export audit events as JSON lines.
+    Export {
+        /// Export events since (e.g. 1h, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Run retention cleanup on old events.
+    Cleanup {
+        /// Override retention period (days).
+        #[arg(long)]
+        days: Option<u32>,
     },
 }
 
@@ -208,6 +262,28 @@ fn main() -> Result<()> {
             CredAction::Test { tool, session } => {
                 commands::cred::test_resolve(&cli.config, &tool, &session)
             }
+        },
+        Commands::Audit { action } => match action {
+            AuditAction::Search {
+                event_type,
+                outcome,
+                operator,
+                tool,
+                since,
+                limit,
+            } => commands::audit::search(
+                &cli.config,
+                event_type.as_deref(),
+                outcome.as_deref(),
+                operator.as_deref(),
+                tool.as_deref(),
+                since.as_deref(),
+                limit,
+            ),
+            AuditAction::Tail { count } => commands::audit::tail(&cli.config, count),
+            AuditAction::Stats { since } => commands::audit::stats(&cli.config, since.as_deref()),
+            AuditAction::Export { since } => commands::audit::export(&cli.config, since.as_deref()),
+            AuditAction::Cleanup { days } => commands::audit::cleanup(&cli.config, days),
         },
         Commands::Session { action } => match action {
             SessionAction::Create {

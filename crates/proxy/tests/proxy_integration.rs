@@ -782,6 +782,83 @@ async fn credential_not_injected_without_binding() {
     token.cancel();
 }
 
+// ── Audit cross-crate integration test ───────────────────────────────
+
+#[tokio::test]
+async fn http_request_produces_audit_event() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Set up audit logger.
+    let audit_db = tmp.path().join("audit.db");
+    let logger = bulwark_audit::logger::AuditLogger::new(&audit_db).unwrap();
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_audit_logger(logger.clone()),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        server_clone
+            .run_with_listener(listener)
+            .await
+            .expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Make an HTTP request through the proxy.
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/test?q=audit"))
+        .send()
+        .await
+        .expect("proxied request");
+    assert_eq!(resp.status(), 200);
+
+    // Shut down the logger to flush events, then stop proxy.
+    logger.shutdown().await;
+    token.cancel();
+
+    // Query the audit store and verify the event.
+    let store = bulwark_audit::store::AuditStore::open(&audit_db).unwrap();
+    let events = store
+        .query(&bulwark_audit::query::AuditFilter::default())
+        .unwrap();
+
+    assert!(!events.is_empty(), "should have at least one audit event");
+    let event = &events[0];
+    assert_eq!(
+        event.event_type,
+        bulwark_audit::event::EventType::RequestProcessed
+    );
+    assert_eq!(event.outcome, bulwark_audit::event::EventOutcome::Success);
+    assert_eq!(event.channel, bulwark_audit::event::Channel::HttpProxy);
+}
+
 #[tokio::test]
 async fn https_connect_tunnel() {
     // This test verifies the CONNECT tunnel works with the local CA.

@@ -511,6 +511,171 @@ rules:
     }
 }
 
+// ── Audit cross-crate integration tests ─────────────────────────────
+
+/// A minimal mock MCP server implemented as a Python script.
+/// Handles initialize, tools/list, and tools/call over stdio JSON-RPC.
+const MOCK_MCP_SERVER_SCRIPT: &str = r#"
+import sys, json
+def respond(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue
+    method = msg.get("method", "")
+    if method == "initialize":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "1.0"}}})
+    elif method == "tools/list":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "greet", "description": "Say hi", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "Hello from mock!"}]}})
+    else:
+        respond({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}})
+"#;
+
+#[tokio::test]
+async fn mcp_tool_call_produces_audit_event() {
+    // Skip if python3 is not available.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found, skipping test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("mock_mcp_server.py");
+    std::fs::write(&script_path, MOCK_MCP_SERVER_SCRIPT).unwrap();
+
+    let audit_db = dir.path().join("audit.db");
+    let logger = bulwark_audit::logger::AuditLogger::new(&audit_db).unwrap();
+
+    let config = bulwark_config::McpGatewayConfig {
+        upstream_servers: vec![bulwark_config::UpstreamServerConfig {
+            name: "mock".into(),
+            command: "python3".into(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: Default::default(),
+        }],
+    };
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let gateway = McpGateway::new(config)
+        .await
+        .unwrap()
+        .with_policy_engine(engine)
+        .with_audit_logger(logger.clone());
+
+    // Send a tools/call for mock__greet (the mock server exposes "greet").
+    let resp = gateway
+        .handle_message(tool_call_request(1, "mock__greet"))
+        .await
+        .unwrap();
+    if let JsonRpcMessage::Response(r) = &resp {
+        assert!(
+            r.error.is_none(),
+            "tool call should succeed, got error: {:?}",
+            r.error
+        );
+    } else {
+        panic!("Expected response");
+    }
+
+    // Shut down the logger to flush events.
+    logger.shutdown().await;
+
+    // Query the audit store and verify the event.
+    let store = bulwark_audit::store::AuditStore::open(&audit_db).unwrap();
+    let events = store
+        .query(&bulwark_audit::query::AuditFilter::default())
+        .unwrap();
+
+    assert!(!events.is_empty(), "should have at least one audit event");
+    let event = &events[0];
+    assert_eq!(
+        event.event_type,
+        bulwark_audit::event::EventType::RequestProcessed
+    );
+    assert_eq!(event.outcome, bulwark_audit::event::EventOutcome::Success);
+    assert_eq!(event.channel, bulwark_audit::event::Channel::McpGateway);
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_denied_tool_call_produces_denied_audit_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_db = dir.path().join("audit.db");
+    let logger = bulwark_audit::logger::AuditLogger::new(&audit_db).unwrap();
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: deny-all
+    verdict: deny
+    reason: "blocked by test policy"
+"#,
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new())
+        .with_policy_engine(engine)
+        .with_audit_logger(logger.clone());
+
+    let resp = gateway
+        .handle_message(tool_call_request(1, "mock__greet"))
+        .await
+        .unwrap();
+    if let JsonRpcMessage::Response(r) = &resp {
+        assert!(r.error.is_some(), "should be denied");
+        assert_eq!(r.error.as_ref().unwrap().code, POLICY_DENIED);
+    } else {
+        panic!("Expected response");
+    }
+
+    // Shut down the logger to flush events.
+    logger.shutdown().await;
+
+    // Query the audit store and verify the denial event.
+    let store = bulwark_audit::store::AuditStore::open(&audit_db).unwrap();
+    let events = store
+        .query(&bulwark_audit::query::AuditFilter::default())
+        .unwrap();
+
+    assert!(!events.is_empty(), "should have at least one audit event");
+    let event = &events[0];
+    assert_eq!(
+        event.event_type,
+        bulwark_audit::event::EventType::PolicyDecision
+    );
+    assert_eq!(event.outcome, bulwark_audit::event::EventOutcome::Denied);
+    assert_eq!(event.channel, bulwark_audit::event::Channel::McpGateway);
+
+    // Verify policy information is included.
+    assert!(event.policy.is_some(), "policy info should be populated");
+    let policy = event.policy.as_ref().unwrap();
+    assert_eq!(policy.verdict, "deny");
+}
+
 #[tokio::test]
 async fn governance_metadata_contains_real_verdict() {
     // Test that governance_metadata() produces correct fields from a real

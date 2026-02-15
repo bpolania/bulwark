@@ -14,6 +14,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use uuid::Uuid;
 
+use bulwark_audit::event::{
+    AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
+};
+use bulwark_audit::logger::AuditLogger;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -28,6 +32,7 @@ pub async fn forward_request(
     _client_addr: SocketAddr,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -202,6 +207,16 @@ pub async fn forward_request(
     let result = client.request(outbound).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+    // Build audit session info if available.
+    let audit_session = session.as_ref().map(|s| SessionInfo {
+        session_id: s.id.clone(),
+        operator: s.operator.clone(),
+        team: s.team.clone(),
+        project: s.project.clone(),
+        environment: s.environment.clone(),
+        agent_type: s.agent_type.clone(),
+    });
+
     match result {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -219,7 +234,7 @@ pub async fn forward_request(
                 timestamp: Utc::now(),
                 method: method.to_string(),
                 url,
-                host,
+                host: host.clone(),
                 status,
                 latency_ms,
                 request_bytes,
@@ -228,6 +243,24 @@ pub async fn forward_request(
                 error: None,
             }
             .emit();
+
+            // Emit audit event.
+            if let Some(ref logger) = audit_logger {
+                let mut builder =
+                    AuditEvent::builder(EventType::RequestProcessed, Channel::HttpProxy)
+                        .outcome(EventOutcome::Success)
+                        .request(RequestInfo {
+                            tool: host,
+                            action: method.to_string(),
+                            resource: None,
+                            target: uri.to_string(),
+                        })
+                        .duration_us(start.elapsed().as_micros() as u64);
+                if let Some(ref si) = audit_session {
+                    builder = builder.session(si.clone());
+                }
+                logger.log(builder.build());
+            }
 
             let body = Full::new(resp_bytes)
                 .map_err(|never| match never {})
@@ -240,7 +273,7 @@ pub async fn forward_request(
                 timestamp: Utc::now(),
                 method: method.to_string(),
                 url,
-                host,
+                host: host.clone(),
                 status: 502,
                 latency_ms,
                 request_bytes,
@@ -249,6 +282,28 @@ pub async fn forward_request(
                 error: Some(e.to_string()),
             }
             .emit();
+
+            // Emit audit event for failed request.
+            if let Some(ref logger) = audit_logger {
+                let mut builder =
+                    AuditEvent::builder(EventType::RequestProcessed, Channel::HttpProxy)
+                        .outcome(EventOutcome::Failed)
+                        .request(RequestInfo {
+                            tool: host,
+                            action: method.to_string(),
+                            resource: None,
+                            target: uri.to_string(),
+                        })
+                        .error(bulwark_audit::event::ErrorInfo {
+                            category: "upstream".to_string(),
+                            message: e.to_string(),
+                        })
+                        .duration_us(start.elapsed().as_micros() as u64);
+                if let Some(ref si) = audit_session {
+                    builder = builder.session(si.clone());
+                }
+                logger.log(builder.build());
+            }
 
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,

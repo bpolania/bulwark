@@ -3,6 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bulwark_audit::event::{
+    AuditEvent, Channel, ErrorInfo, EventOutcome, EventType, PolicyInfo, RequestInfo, SessionInfo,
+};
+use bulwark_audit::logger::AuditLogger;
 use bulwark_config::McpGatewayConfig;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::session::Session;
@@ -23,6 +27,7 @@ pub struct McpGateway {
     config: McpGatewayConfig,
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    audit_logger: Option<AuditLogger>,
     /// Session token set by the agent (e.g. via an initialize param or header).
     session_token: parking_lot::Mutex<Option<String>>,
 }
@@ -43,6 +48,7 @@ impl McpGateway {
             config,
             policy_engine: None,
             vault: None,
+            audit_logger: None,
             session_token: parking_lot::Mutex::new(None),
         })
     }
@@ -56,6 +62,7 @@ impl McpGateway {
             config: McpGatewayConfig::default(),
             policy_engine: None,
             vault: None,
+            audit_logger: None,
             session_token: parking_lot::Mutex::new(None),
         }
     }
@@ -69,6 +76,12 @@ impl McpGateway {
     /// Attach a vault for session validation and credential injection.
     pub fn with_vault(mut self, vault: Arc<parking_lot::Mutex<Vault>>) -> Self {
         self.vault = Some(vault);
+        self
+    }
+
+    /// Attach an audit logger for event logging.
+    pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
+        self.audit_logger = Some(logger);
         self
     }
 
@@ -273,7 +286,18 @@ impl McpGateway {
             Err(err_resp) => return err_resp,
         };
 
+        // Build audit session info from the vault session.
+        let audit_session = session.as_ref().map(|s| SessionInfo {
+            session_id: s.id.clone(),
+            operator: s.operator.clone(),
+            team: s.team.clone(),
+            project: s.project.clone(),
+            environment: s.environment.clone(),
+            agent_type: s.agent_type.clone(),
+        });
+
         // Evaluate policy before upstream lookup (fail-fast on denial).
+        let mut policy_info: Option<PolicyInfo> = None;
         if let Some(engine) = &self.policy_engine {
             use bulwark_policy::context::RequestContext;
             use bulwark_policy::verdict::Verdict;
@@ -296,6 +320,15 @@ impl McpGateway {
             }
             let eval = engine.evaluate(&ctx);
 
+            policy_info = Some(PolicyInfo {
+                verdict: format!("{:?}", eval.verdict).to_lowercase(),
+                matched_rule: eval.matched_rule.clone(),
+                matched_policy: eval.matched_policy.clone(),
+                scope: Some(format!("{:?}", eval.scope).to_lowercase()),
+                reason: eval.reason.clone(),
+                evaluation_time_us: eval.evaluation_time.as_micros() as u64,
+            });
+
             match eval.verdict {
                 Verdict::Allow => {
                     tracing::debug!(
@@ -309,6 +342,28 @@ impl McpGateway {
                         reason = %eval.reason,
                         "policy: deny"
                     );
+
+                    // Emit audit event for denied request.
+                    if let Some(ref logger) = self.audit_logger {
+                        let mut builder =
+                            AuditEvent::builder(EventType::PolicyDecision, Channel::McpGateway)
+                                .outcome(EventOutcome::Denied)
+                                .request(RequestInfo {
+                                    tool: server_name.to_string(),
+                                    action: tool_name.to_string(),
+                                    resource: None,
+                                    target: params.name.clone(),
+                                })
+                                .duration_us(start.elapsed().as_micros() as u64);
+                        if let Some(ref si) = audit_session {
+                            builder = builder.session(si.clone());
+                        }
+                        if let Some(ref pi) = policy_info {
+                            builder = builder.policy(pi.clone());
+                        }
+                        logger.log(builder.build());
+                    }
+
                     return JsonRpcResponse::error(
                         req.id.clone(),
                         POLICY_DENIED,
@@ -321,6 +376,28 @@ impl McpGateway {
                         reason = %eval.reason,
                         "policy: escalate"
                     );
+
+                    // Emit audit event for escalated request.
+                    if let Some(ref logger) = self.audit_logger {
+                        let mut builder =
+                            AuditEvent::builder(EventType::PolicyDecision, Channel::McpGateway)
+                                .outcome(EventOutcome::Escalated)
+                                .request(RequestInfo {
+                                    tool: server_name.to_string(),
+                                    action: tool_name.to_string(),
+                                    resource: None,
+                                    target: params.name.clone(),
+                                })
+                                .duration_us(start.elapsed().as_micros() as u64);
+                        if let Some(ref si) = audit_session {
+                            builder = builder.session(si.clone());
+                        }
+                        if let Some(ref pi) = policy_info {
+                            builder = builder.policy(pi.clone());
+                        }
+                        logger.log(builder.build());
+                    }
+
                     return JsonRpcResponse::error(
                         req.id.clone(),
                         POLICY_ESCALATED,
@@ -351,7 +428,8 @@ impl McpGateway {
         // Forward to upstream.
         let mut server = upstream.lock().await;
         let result = server.call_tool(tool_name, params.arguments).await;
-        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let duration_us = start.elapsed().as_micros() as u64;
+        let latency_ms = duration_us as f64 / 1000.0;
 
         match result {
             Ok(tool_result) => {
@@ -362,6 +440,32 @@ impl McpGateway {
                     is_error = tool_result.is_error.unwrap_or(false),
                     "Tool call complete"
                 );
+
+                // Build and emit audit event for successful tool call.
+                let audit_event_id = if let Some(ref logger) = self.audit_logger {
+                    let mut builder =
+                        AuditEvent::builder(EventType::RequestProcessed, Channel::McpGateway)
+                            .outcome(EventOutcome::Success)
+                            .request(RequestInfo {
+                                tool: server_name.to_string(),
+                                action: tool_name.to_string(),
+                                resource: None,
+                                target: params.name.clone(),
+                            })
+                            .duration_us(duration_us);
+                    if let Some(ref si) = audit_session {
+                        builder = builder.session(si.clone());
+                    }
+                    if let Some(ref pi) = policy_info {
+                        builder = builder.policy(pi.clone());
+                    }
+                    let event = builder.build();
+                    let id = event.id.clone();
+                    logger.log(event);
+                    Some(id)
+                } else {
+                    None
+                };
 
                 // Attach governance metadata.
                 let mut result_value = serde_json::to_value(&tool_result).unwrap();
@@ -374,10 +478,13 @@ impl McpGateway {
                     } else {
                         governance_metadata_stub()
                     };
-                    // Add session_id to governance metadata.
-                    if let Some(ref s) = session {
-                        if let Some(gov) = meta.get_mut("governance") {
+                    // Add session_id and audit_event_id to governance metadata.
+                    if let Some(gov) = meta.get_mut("governance") {
+                        if let Some(ref s) = session {
                             gov["session_id"] = serde_json::Value::String(s.id.clone());
+                        }
+                        if let Some(ref id) = audit_event_id {
+                            gov["audit_event_id"] = serde_json::Value::String(id.clone());
                         }
                     }
                     obj.insert("_meta".to_string(), meta);
@@ -393,6 +500,32 @@ impl McpGateway {
                     error = %e,
                     "Tool call failed"
                 );
+
+                // Emit audit event for failed tool call.
+                if let Some(ref logger) = self.audit_logger {
+                    let mut builder =
+                        AuditEvent::builder(EventType::RequestProcessed, Channel::McpGateway)
+                            .outcome(EventOutcome::Failed)
+                            .request(RequestInfo {
+                                tool: server_name.to_string(),
+                                action: tool_name.to_string(),
+                                resource: None,
+                                target: params.name.clone(),
+                            })
+                            .error(ErrorInfo {
+                                category: "upstream".to_string(),
+                                message: e.to_string(),
+                            })
+                            .duration_us(duration_us);
+                    if let Some(ref si) = audit_session {
+                        builder = builder.session(si.clone());
+                    }
+                    if let Some(ref pi) = policy_info {
+                        builder = builder.policy(pi.clone());
+                    }
+                    logger.log(builder.build());
+                }
+
                 JsonRpcResponse::error(req.id.clone(), INTERNAL_ERROR, e.to_string())
             }
         }

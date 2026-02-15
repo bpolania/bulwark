@@ -14,6 +14,11 @@ policy:
 vault:
   require_sessions: false   # Start permissive, enable when ready
 
+audit:
+  enabled: true
+  db_path: "~/.bulwark/audit.db"
+  retention_days: 90
+
 # mcp_gateway:
 #   upstream_servers:
 #     - name: github
