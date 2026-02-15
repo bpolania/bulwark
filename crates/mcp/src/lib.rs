@@ -1,2 +1,15 @@
-//! Bulwark mcp — not yet implemented.
-//! This crate will be built in a future phase.
+//! Bulwark MCP — governance gateway for the Model Context Protocol.
+//!
+//! Bulwark acts as an MCP server (agent-facing) and as an MCP client
+//! (connecting to upstream tool servers).  Every tool call passes through
+//! the gateway — logged now, enforced by policy later.
+#![forbid(unsafe_code)]
+
+pub mod client;
+pub mod gateway;
+pub mod governance;
+pub mod logging;
+pub mod server;
+pub mod transport;
+pub mod types;
+pub mod upstream;

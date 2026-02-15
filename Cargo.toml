@@ -23,6 +23,7 @@ rust-version = "1.85"
 bulwark-common = { path = "crates/common" }
 bulwark-config = { path = "crates/config" }
 bulwark-proxy = { path = "crates/proxy" }
+bulwark-mcp = { path = "crates/mcp" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }

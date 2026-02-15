@@ -40,12 +40,23 @@ enum Commands {
         #[command(subcommand)]
         action: CaAction,
     },
+    /// Run the MCP governance gateway.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
 }
 
 #[derive(Subcommand)]
 enum CaAction {
     /// Print the CA certificate PEM to stdout.
     Export,
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Start the MCP gateway (stdio mode).
+    Start,
 }
 
 #[derive(Subcommand)]
@@ -70,6 +81,9 @@ fn main() -> Result<()> {
         Commands::Init { path } => commands::init::run(path.as_deref()),
         Commands::Ca { action } => match action {
             CaAction::Export => commands::ca::export(&cli.config),
+        },
+        Commands::Mcp { action } => match action {
+            McpAction::Start => commands::mcp::start(&cli.config, cli.log_level.as_deref()),
         },
     }
 }

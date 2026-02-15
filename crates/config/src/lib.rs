@@ -4,9 +4,10 @@
 //! when the file does not exist.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level Bulwark configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -16,6 +17,8 @@ pub struct BulwarkConfig {
     pub proxy: ProxyConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
+    /// MCP gateway settings.
+    pub mcp_gateway: McpGatewayConfig,
 }
 
 /// Configuration for the proxy listener.
@@ -80,6 +83,38 @@ impl Default for LoggingConfig {
             format: LogFormat::default(),
             level: "info".to_string(),
         }
+    }
+}
+
+/// Configuration for the MCP governance gateway.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpGatewayConfig {
+    /// Upstream MCP tool servers.
+    pub upstream_servers: Vec<UpstreamServerConfig>,
+}
+
+/// Configuration for a single upstream MCP tool server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamServerConfig {
+    /// Logical name used for tool namespacing.
+    pub name: String,
+    /// Command to spawn (e.g. `"npx"`).
+    pub command: String,
+    /// Arguments passed to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the child process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Resolve `${VAR_NAME}` references in a string to environment variables.
+pub fn resolve_env_vars(value: &str) -> String {
+    if let Some(var_name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        std::env::var(var_name).unwrap_or_default()
+    } else {
+        value.to_string()
     }
 }
 

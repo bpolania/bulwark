@@ -21,6 +21,10 @@ pub enum BulwarkError {
     #[error("proxy error: {0}")]
     Proxy(String),
 
+    /// An MCP-related error.
+    #[error("MCP error: {0}")]
+    Mcp(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
