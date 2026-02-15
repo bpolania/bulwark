@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bulwark_config::McpGatewayConfig;
+use bulwark_policy::engine::PolicyEngine;
+use bulwark_vault::session::Session;
+use bulwark_vault::store::Vault;
 
-use crate::governance::governance_metadata_stub;
+use crate::governance::{governance_metadata, governance_metadata_stub};
 use crate::types::{
     INTERNAL_ERROR, INVALID_REQUEST, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, METHOD_NOT_FOUND, ServerCapabilities, ServerInfo, Tool, ToolCallParams,
-    ToolsCapability,
+    JsonRpcResponse, METHOD_NOT_FOUND, POLICY_DENIED, POLICY_ESCALATED, SESSION_REQUIRED,
+    ServerCapabilities, ServerInfo, Tool, ToolCallParams, ToolsCapability,
 };
 use crate::upstream::UpstreamServer;
 
@@ -18,6 +21,10 @@ pub struct McpGateway {
     upstreams: HashMap<String, Arc<tokio::sync::Mutex<UpstreamServer>>>,
     #[allow(dead_code)]
     config: McpGatewayConfig,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
+    /// Session token set by the agent (e.g. via an initialize param or header).
+    session_token: parking_lot::Mutex<Option<String>>,
 }
 
 impl McpGateway {
@@ -31,7 +38,13 @@ impl McpGateway {
                 Arc::new(tokio::sync::Mutex::new(server)),
             );
         }
-        Ok(Self { upstreams, config })
+        Ok(Self {
+            upstreams,
+            config,
+            policy_engine: None,
+            vault: None,
+            session_token: parking_lot::Mutex::new(None),
+        })
     }
 
     /// Create a gateway with pre-built upstream servers (for testing).
@@ -41,6 +54,70 @@ impl McpGateway {
         Self {
             upstreams,
             config: McpGatewayConfig::default(),
+            policy_engine: None,
+            vault: None,
+            session_token: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Attach a policy engine for request evaluation.
+    pub fn with_policy_engine(mut self, engine: Arc<PolicyEngine>) -> Self {
+        self.policy_engine = Some(engine);
+        self
+    }
+
+    /// Attach a vault for session validation and credential injection.
+    pub fn with_vault(mut self, vault: Arc<parking_lot::Mutex<Vault>>) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    /// Set the session token (called by transport layer or agent).
+    pub fn set_session_token(&self, token: String) {
+        *self.session_token.lock() = Some(token);
+    }
+
+    /// Validate the current session token against the vault.
+    /// Returns the session if valid, or an error response if not.
+    #[allow(clippy::result_large_err)]
+    fn validate_session(
+        &self,
+        request_id: &crate::types::RequestId,
+    ) -> Result<Option<Session>, JsonRpcResponse> {
+        let vault = match &self.vault {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let vault_guard = vault.lock();
+
+        let token = self.session_token.lock().clone();
+        let token = match token {
+            Some(t) => t,
+            None => {
+                if vault_guard.require_sessions() {
+                    return Err(JsonRpcResponse::error(
+                        request_id.clone(),
+                        SESSION_REQUIRED,
+                        "Session token required. Set via X-Bulwark-Session header.".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+        };
+
+        match vault_guard.validate_session(&token) {
+            Ok(Some(session)) => Ok(Some(session)),
+            Ok(None) => Err(JsonRpcResponse::error(
+                request_id.clone(),
+                SESSION_REQUIRED,
+                "Invalid or expired session token.".to_string(),
+            )),
+            Err(e) => Err(JsonRpcResponse::error(
+                request_id.clone(),
+                INTERNAL_ERROR,
+                format!("Session validation error: {e}"),
+            )),
         }
     }
 
@@ -182,6 +259,83 @@ impl McpGateway {
             }
         };
 
+        let start = std::time::Instant::now();
+        tracing::info!(
+            server = %server_name,
+            tool = %tool_name,
+            namespaced_tool = %params.name,
+            "Tool call"
+        );
+
+        // Validate session if vault is configured.
+        let session = match self.validate_session(&req.id) {
+            Ok(s) => s,
+            Err(err_resp) => return err_resp,
+        };
+
+        // Evaluate policy before upstream lookup (fail-fast on denial).
+        if let Some(engine) = &self.policy_engine {
+            use bulwark_policy::context::RequestContext;
+            use bulwark_policy::verdict::Verdict;
+
+            let mut ctx = RequestContext::new(server_name, tool_name);
+            if let Some(ref s) = session {
+                ctx = ctx.with_operator(&s.operator);
+                if let Some(ref team) = s.team {
+                    ctx = ctx.with_team(team);
+                }
+                if let Some(ref project) = s.project {
+                    ctx = ctx.with_project(project);
+                }
+                if let Some(ref env) = s.environment {
+                    ctx = ctx.with_environment(env);
+                }
+                if let Some(ref agent) = s.agent_type {
+                    ctx = ctx.with_agent_type(agent);
+                }
+            }
+            let eval = engine.evaluate(&ctx);
+
+            match eval.verdict {
+                Verdict::Allow => {
+                    tracing::debug!(
+                        rule = eval.matched_rule.as_deref().unwrap_or("none"),
+                        "policy: allow"
+                    );
+                }
+                Verdict::Deny => {
+                    tracing::warn!(
+                        rule = eval.matched_rule.as_deref().unwrap_or("none"),
+                        reason = %eval.reason,
+                        "policy: deny"
+                    );
+                    return JsonRpcResponse::error(
+                        req.id.clone(),
+                        POLICY_DENIED,
+                        format!("Policy denied: {}", eval.reason),
+                    );
+                }
+                Verdict::Escalate => {
+                    tracing::warn!(
+                        rule = eval.matched_rule.as_deref().unwrap_or("none"),
+                        reason = %eval.reason,
+                        "policy: escalate"
+                    );
+                    return JsonRpcResponse::error(
+                        req.id.clone(),
+                        POLICY_ESCALATED,
+                        format!("Policy escalation required: {}", eval.reason),
+                    );
+                }
+                Verdict::Transform => {
+                    tracing::info!(
+                        rule = eval.matched_rule.as_deref().unwrap_or("none"),
+                        "policy: transform (not yet implemented, allowing)"
+                    );
+                }
+            }
+        }
+
         // Find upstream server.
         let upstream = match self.upstreams.get(server_name) {
             Some(u) => u,
@@ -193,14 +347,6 @@ impl McpGateway {
                 );
             }
         };
-
-        let start = std::time::Instant::now();
-        tracing::info!(
-            server = %server_name,
-            tool = %tool_name,
-            namespaced_tool = %params.name,
-            "Tool call"
-        );
 
         // Forward to upstream.
         let mut server = upstream.lock().await;
@@ -217,10 +363,24 @@ impl McpGateway {
                     "Tool call complete"
                 );
 
-                // Attach governance metadata stub.
+                // Attach governance metadata.
                 let mut result_value = serde_json::to_value(&tool_result).unwrap();
                 if let Some(obj) = result_value.as_object_mut() {
-                    obj.insert("_meta".to_string(), governance_metadata_stub());
+                    let mut meta = if let Some(engine) = &self.policy_engine {
+                        use bulwark_policy::context::RequestContext;
+                        let ctx = RequestContext::new(server_name, tool_name);
+                        let eval = engine.evaluate(&ctx);
+                        governance_metadata(&eval)
+                    } else {
+                        governance_metadata_stub()
+                    };
+                    // Add session_id to governance metadata.
+                    if let Some(ref s) = session {
+                        if let Some(gov) = meta.get_mut("governance") {
+                            gov["session_id"] = serde_json::Value::String(s.id.clone());
+                        }
+                    }
+                    obj.insert("_meta".to_string(), meta);
                 }
 
                 JsonRpcResponse::success(req.id.clone(), result_value)

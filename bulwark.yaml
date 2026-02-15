@@ -7,6 +7,13 @@ logging:
   format: json
   level: info
 
+policy:
+  policies_dir: "./policies"
+  hot_reload: true
+
+vault:
+  require_sessions: false   # Start permissive, enable when ready
+
 # mcp_gateway:
 #   upstream_servers:
 #     - name: github

@@ -4,13 +4,15 @@
 //! rather than spawning real child processes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bulwark_mcp::gateway::McpGateway;
 use bulwark_mcp::transport::stdio::StdioTransport;
 use bulwark_mcp::types::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId, Tool,
-    ToolCallParams,
+    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, POLICY_DENIED, RequestId,
+    Tool, ToolCallParams,
 };
+use bulwark_policy::engine::PolicyEngine;
 use tokio::io::{DuplexStream, duplex};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -388,4 +390,151 @@ async fn unsolicited_response_returns_none() {
     ));
 
     assert!(gateway.handle_message(msg).await.is_none());
+}
+
+// ── Policy integration tests ─────────────────────────────────────────
+
+/// Build a PolicyEngine from inline YAML.
+fn engine_with_rules(yaml: &str) -> Arc<PolicyEngine> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("test.yaml"), yaml).unwrap();
+    Arc::new(PolicyEngine::from_directory(dir.path()).unwrap())
+}
+
+/// Build a tools/call request for the given namespaced tool name.
+fn tool_call_request(id: i64, namespaced_name: &str) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(id),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": namespaced_name,
+            "arguments": {}
+        })),
+    })
+}
+
+#[tokio::test]
+async fn tool_call_allowed_by_policy() {
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_policy_engine(engine);
+
+    // Policy allows, but no upstream exists → expect "Unknown server" error,
+    // NOT a policy denial.
+    let resp = gateway
+        .handle_message(tool_call_request(1, "mock__read"))
+        .await
+        .unwrap();
+
+    if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("should have an error (no upstream)");
+        assert_ne!(err.code, POLICY_DENIED, "should NOT be a policy denial");
+        assert!(
+            err.message.contains("Unknown server"),
+            "expected 'Unknown server', got: {}",
+            err.message,
+        );
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn tool_call_denied_by_policy() {
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: deny-all
+    verdict: deny
+    reason: "blocked by test policy"
+"#,
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_policy_engine(engine);
+
+    let resp = gateway
+        .handle_message(tool_call_request(1, "mock__read"))
+        .await
+        .unwrap();
+
+    if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("should be denied");
+        assert_eq!(err.code, POLICY_DENIED);
+        assert!(err.message.contains("Policy denied"));
+        assert!(err.message.contains("blocked by test policy"));
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn tool_call_default_deny_no_matching_rule() {
+    // Policy has a rule that only matches a different tool — no rule matches
+    // the requested tool, so the engine's default-deny kicks in.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-specific
+    verdict: allow
+    match:
+      tools: ["other_server"]
+      actions: ["specific_action"]
+"#,
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_policy_engine(engine);
+
+    let resp = gateway
+        .handle_message(tool_call_request(1, "mock__read"))
+        .await
+        .unwrap();
+
+    if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("should be denied by default");
+        assert_eq!(err.code, POLICY_DENIED);
+        assert!(
+            err.message.contains("default deny"),
+            "expected default deny message, got: {}",
+            err.message,
+        );
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn governance_metadata_contains_real_verdict() {
+    // Test that governance_metadata() produces correct fields from a real
+    // policy evaluation (cross-crate: policy engine → MCP governance).
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-reads
+    verdict: allow
+    reason: "read operations are safe"
+    match:
+      tools: ["*"]
+      actions: ["read_*"]
+"#,
+    );
+
+    let ctx = bulwark_policy::context::RequestContext::new("fs", "read_file");
+    let eval = engine.evaluate(&ctx);
+
+    let meta = bulwark_mcp::governance::governance_metadata(&eval);
+
+    assert_eq!(meta["governance"]["verdict"], "allow");
+    assert_eq!(meta["governance"]["matched_rule"], "allow-reads");
+    assert_eq!(meta["governance"]["reason"], "read operations are safe");
+    assert_eq!(meta["governance"]["version"], "0.1.0");
+    assert!(meta["governance"]["evaluation_time_us"].is_number());
 }

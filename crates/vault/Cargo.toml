@@ -4,4 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Bulwark credential vault"
+description = "Bulwark credential vault and session management"
+
+[dependencies]
+bulwark-common.workspace = true
+bulwark-config.workspace = true
+bulwark-policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+secrecy.workspace = true
+age.workspace = true
+rusqlite.workspace = true
+base64.workspace = true
+rand.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

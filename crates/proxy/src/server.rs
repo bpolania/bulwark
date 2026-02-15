@@ -11,6 +11,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use bulwark_config::ProxyConfig;
+use bulwark_policy::engine::PolicyEngine;
+use bulwark_vault::store::Vault;
 
 use crate::handler;
 use crate::tls::TlsState;
@@ -21,6 +23,8 @@ pub struct ProxyServer {
     tls_state: Arc<TlsState>,
     shutdown: CancellationToken,
     start_time: Instant,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
 }
 
 impl ProxyServer {
@@ -35,7 +39,21 @@ impl ProxyServer {
             tls_state,
             shutdown: CancellationToken::new(),
             start_time: Instant::now(),
+            policy_engine: None,
+            vault: None,
         })
+    }
+
+    /// Attach a policy engine for request evaluation.
+    pub fn with_policy_engine(mut self, engine: Arc<PolicyEngine>) -> Self {
+        self.policy_engine = Some(engine);
+        self
+    }
+
+    /// Attach a vault for session validation and credential injection.
+    pub fn with_vault(mut self, vault: Arc<parking_lot::Mutex<Vault>>) -> Self {
+        self.vault = Some(vault);
+        self
     }
 
     /// Return the CA certificate in DER form (useful for tests).
@@ -127,11 +145,15 @@ impl ProxyServer {
     fn spawn_connection(&self, stream: tokio::net::TcpStream, addr: SocketAddr) {
         let tls_state = Arc::clone(&self.tls_state);
         let start_time = self.start_time;
+        let policy_engine = self.policy_engine.clone();
+        let vault = self.vault.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let tls = Arc::clone(&tls_state);
-                async move { handler::handle_request(req, addr, tls, start_time).await }
+                let policy = policy_engine.clone();
+                let vault = vault.clone();
+                async move { handler::handle_request(req, addr, tls, start_time, policy, vault).await }
             });
 
             let builder = Builder::new(TokioExecutor::new());

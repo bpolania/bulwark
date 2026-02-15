@@ -19,6 +19,10 @@ pub struct BulwarkConfig {
     pub logging: LoggingConfig,
     /// MCP gateway settings.
     pub mcp_gateway: McpGatewayConfig,
+    /// Policy engine settings.
+    pub policy: PolicyConfig,
+    /// Vault settings.
+    pub vault: VaultConfig,
 }
 
 /// Configuration for the proxy listener.
@@ -107,6 +111,55 @@ pub struct UpstreamServerConfig {
     /// Environment variables to set for the child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// Policy engine configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    /// Directory containing YAML policy files.
+    pub policies_dir: String,
+    /// Whether to watch for policy file changes and reload automatically.
+    pub hot_reload: bool,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            policies_dir: "./policies".to_string(),
+            hot_reload: true,
+        }
+    }
+}
+
+/// Credential vault configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Path to the vault key file.
+    pub key_path: String,
+    /// Path to the credentials directory.
+    pub credentials_dir: String,
+    /// Path to the bindings file.
+    pub bindings_path: String,
+    /// Path to the sessions database.
+    pub sessions_db_path: String,
+    /// Whether sessions are required (strict mode).
+    /// If true, requests without a valid session token are rejected.
+    /// If false, requests without a session proceed with no operator context.
+    pub require_sessions: bool,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            key_path: "~/.bulwark/vault-key.age".to_string(),
+            credentials_dir: "~/.bulwark/credentials".to_string(),
+            bindings_path: "~/.bulwark/bindings.yaml".to_string(),
+            sessions_db_path: "~/.bulwark/sessions.db".to_string(),
+            require_sessions: false,
+        }
+    }
 }
 
 /// Resolve `${VAR_NAME}` references in a string to environment variables.

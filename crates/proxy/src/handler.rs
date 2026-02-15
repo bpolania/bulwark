@@ -10,6 +10,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
 
+use bulwark_policy::engine::PolicyEngine;
+use bulwark_vault::store::Vault;
+
 use crate::forward::{self, BoxBody};
 use crate::tls::TlsState;
 use crate::tunnel;
@@ -26,10 +29,12 @@ pub async fn handle_request(
     client_addr: SocketAddr,
     tls_state: Arc<TlsState>,
     start_time: Instant,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // CONNECT method → HTTPS tunnel with TLS MITM
     if req.method() == Method::CONNECT {
-        return tunnel::handle_connect(req, client_addr, tls_state).await;
+        return tunnel::handle_connect(req, client_addr, tls_state, policy_engine, vault).await;
     }
 
     // Check for internal routes (relative path, no scheme/authority).
@@ -39,7 +44,7 @@ pub async fn handle_request(
     }
 
     // Absolute URI → forward proxy
-    forward::forward_request(req, client_addr).await
+    forward::forward_request(req, client_addr, policy_engine, vault).await
 }
 
 /// Handle requests aimed at Bulwark itself (health check, etc.).

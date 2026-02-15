@@ -1,10 +1,13 @@
 //! `bulwark proxy start` — load config, set up tracing, run the proxy.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bulwark_config::{LogFormat, load_config};
+use bulwark_policy::engine::PolicyEngine;
 use bulwark_proxy::server::ProxyServer;
+use bulwark_vault::store::Vault;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -46,10 +49,49 @@ pub fn start(
 
     // Build a tokio runtime and run the server.
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    let policies_dir = config.policy.policies_dir.clone();
+
+    let vault_config = config.vault.clone();
+
     rt.block_on(async {
-        let server = ProxyServer::new(config.proxy)
+        let mut server = ProxyServer::new(config.proxy)
             .await
             .context("initialising proxy server")?;
+
+        // Load the policy engine if the policies directory exists.
+        let policies_path = Path::new(&policies_dir);
+        if policies_path.exists() {
+            match PolicyEngine::from_directory(policies_path) {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    tracing::info!(
+                        rules = engine.rule_count(),
+                        dir = %policies_path.display(),
+                        "policy engine loaded"
+                    );
+                    server = server.with_policy_engine(engine);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load policies, running without policy enforcement");
+                }
+            }
+        } else {
+            tracing::info!(dir = %policies_path.display(), "policies directory not found, running without policy enforcement");
+        }
+
+        // Load the vault if the key exists.
+        let key_path = bulwark_config::expand_tilde(&vault_config.key_path);
+        if Path::new(&key_path).exists() {
+            match Vault::open(&vault_config) {
+                Ok(vault) => {
+                    tracing::info!("vault loaded");
+                    server = server.with_vault(Arc::new(parking_lot::Mutex::new(vault)));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open vault, running without credential injection");
+                }
+            }
+        }
 
         let shutdown_token = server.shutdown_token();
 

@@ -9,6 +9,8 @@ description = "Bulwark MCP gateway"
 [dependencies]
 bulwark-common.workspace = true
 bulwark-config.workspace = true
+bulwark-policy.workspace = true
+bulwark-vault.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,6 +20,7 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

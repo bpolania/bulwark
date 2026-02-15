@@ -25,6 +25,14 @@ pub enum BulwarkError {
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    /// A policy evaluation error.
+    #[error("policy error: {0}")]
+    Policy(String),
+
+    /// A vault-related error.
+    #[error("vault error: {0}")]
+    Vault(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

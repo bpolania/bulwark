@@ -25,6 +25,9 @@ use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
+use bulwark_policy::engine::PolicyEngine;
+use bulwark_vault::store::Vault;
+
 use crate::forward::{BoxBody, error_response};
 use crate::logging::RequestLog;
 use crate::tls::TlsState;
@@ -35,6 +38,8 @@ pub async fn handle_connect(
     req: Request<Incoming>,
     _client_addr: SocketAddr,
     tls_state: Arc<TlsState>,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // Extract the target host:port from the CONNECT URI.
     let target_authority = match req.uri().authority() {
@@ -50,10 +55,37 @@ pub async fn handle_connect(
     let target_host = req.uri().host().unwrap_or("unknown").to_string();
     let target_port = req.uri().port_u16().unwrap_or(443);
 
+    // Evaluate policy on the CONNECT target if engine is configured.
+    if let Some(engine) = &policy_engine {
+        use bulwark_policy::context::RequestContext;
+        use bulwark_policy::verdict::Verdict;
+
+        let ctx = RequestContext::new(&target_host, format!("CONNECT {}", target_authority));
+        let eval = engine.evaluate(&ctx);
+
+        match eval.verdict {
+            Verdict::Allow | Verdict::Transform => {}
+            Verdict::Deny | Verdict::Escalate => {
+                tracing::warn!(
+                    host = %target_host,
+                    verdict = ?eval.verdict,
+                    reason = %eval.reason,
+                    "policy denied CONNECT"
+                );
+                return Ok(error_response(
+                    StatusCode::FORBIDDEN,
+                    &format!("Policy denied: {}", eval.reason),
+                ));
+            }
+        }
+    }
+
     // Spawn the MITM task after the upgrade completes.
     let tls_state_clone = Arc::clone(&tls_state);
     let target_host_clone = target_host.clone();
     let target_authority_clone = target_authority.clone();
+    let policy_engine_clone = policy_engine;
+    let vault_clone = vault;
 
     tokio::spawn(async move {
         // Wait for the HTTP upgrade to complete.
@@ -71,6 +103,8 @@ pub async fn handle_connect(
             target_port,
             &target_authority_clone,
             tls_state_clone,
+            policy_engine_clone,
+            vault_clone,
         )
         .await
         {
@@ -97,6 +131,8 @@ async fn mitm_tunnel(
     target_port: u16,
     _target_authority: &str,
     tls_state: Arc<TlsState>,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
 ) -> bulwark_common::Result<()> {
     // --- Client-side TLS (we are the "server" to the client) ---
     let server_config = ServerConfig::builder()
@@ -137,7 +173,9 @@ async fn mitm_tunnel(
         let host = target_host_owned.clone();
         let port = target_port_owned;
         let connector = tls_state.server_connector.clone();
-        async move { forward_tls_request(req, &host, port, connector).await }
+        let policy = policy_engine.clone();
+        let vault = vault.clone();
+        async move { forward_tls_request(req, &host, port, connector, policy, vault).await }
     });
 
     let conn = http1::Builder::new()
@@ -158,6 +196,8 @@ async fn forward_tls_request(
     target_host: &str,
     target_port: u16,
     connector: TlsConnector,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -170,6 +210,103 @@ async fn forward_tls_request(
         .unwrap_or_else(|| "/".to_string());
     let url = format!("https://{target_host}{path}");
     let host = target_host.to_string();
+
+    // Validate session from X-Bulwark-Session header if vault is configured.
+    let session = if let Some(ref vault) = vault {
+        let vault_guard = vault.lock();
+        let token = req
+            .headers()
+            .get("x-bulwark-session")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        match token {
+            Some(t) => match vault_guard.validate_session(&t) {
+                Ok(Some(s)) => Some(s),
+                Ok(None) => {
+                    return Ok(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid or expired session token",
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "session validation error");
+                    return Ok(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Session validation error",
+                    ));
+                }
+            },
+            None => {
+                if vault_guard.require_sessions() {
+                    return Ok(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Session token required. Set X-Bulwark-Session header.",
+                    ));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Evaluate policy if engine is configured.
+    if let Some(engine) = &policy_engine {
+        use bulwark_policy::context::RequestContext;
+        use bulwark_policy::verdict::Verdict;
+
+        let action = format!("{} {}", method, path);
+        let mut ctx = RequestContext::new(target_host, action);
+        if let Some(ref s) = session {
+            ctx = ctx.with_operator(&s.operator);
+            if let Some(ref team) = s.team {
+                ctx = ctx.with_team(team);
+            }
+            if let Some(ref project) = s.project {
+                ctx = ctx.with_project(project);
+            }
+            if let Some(ref env) = s.environment {
+                ctx = ctx.with_environment(env);
+            }
+            if let Some(ref agent) = s.agent_type {
+                ctx = ctx.with_agent_type(agent);
+            }
+        }
+        let eval = engine.evaluate(&ctx);
+
+        match eval.verdict {
+            Verdict::Allow | Verdict::Transform => {}
+            Verdict::Deny | Verdict::Escalate => {
+                tracing::warn!(
+                    host = %host,
+                    method = %method,
+                    verdict = ?eval.verdict,
+                    reason = %eval.reason,
+                    "policy denied HTTPS request"
+                );
+                return Ok(error_response(
+                    StatusCode::FORBIDDEN,
+                    &format!("Policy denied: {}", eval.reason),
+                ));
+            }
+        }
+    }
+
+    // Resolve credential injection if vault + session are available.
+    let injection = if let (Some(vault), Some(session)) = (&vault, &session) {
+        let vault_guard = vault.lock();
+        match vault_guard.resolve_credential(target_host, session) {
+            Ok(Some(cred)) => Some(bulwark_vault::injection::http_injection(&cred)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "credential resolution failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Collect request body.
     let (parts, body) = req.into_parts();
@@ -264,8 +401,14 @@ async fn forward_tls_request(
     // Build the outbound request.
     let mut builder = Request::builder().method(parts.method).uri(&path);
     if let Some(headers) = builder.headers_mut() {
+        // Determine which headers to strip (hop-by-hop + injection strips).
+        let strip_set: std::collections::HashSet<String> = injection
+            .as_ref()
+            .map(|inj| inj.strip_headers.iter().cloned().collect())
+            .unwrap_or_default();
+
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop(name.as_str()) {
+            if !is_hop_by_hop(name.as_str()) && !strip_set.contains(&name.as_str().to_lowercase()) {
                 headers.insert(name.clone(), value.clone());
             }
         }
@@ -275,6 +418,21 @@ async fn forward_tls_request(
                 .parse()
                 .unwrap_or_else(|_| "unknown".parse().unwrap()),
         );
+
+        // Inject credential headers.
+        if let Some(ref inj) = injection {
+            use secrecy::ExposeSecret;
+            for (header_name, header_value) in &inj.headers {
+                if let Ok(hv) = header_value
+                    .expose_secret()
+                    .parse::<hyper::header::HeaderValue>()
+                {
+                    if let Ok(hn) = header_name.parse::<hyper::header::HeaderName>() {
+                        headers.insert(hn, hv);
+                    }
+                }
+            }
+        }
     }
 
     let outbound: Request<BoxBody> = match builder.body(

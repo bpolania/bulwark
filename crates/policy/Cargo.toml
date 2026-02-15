@@ -5,3 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Bulwark policy engine"
+
+[dependencies]
+bulwark-common.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+arc-swap = { workspace = true }
+notify = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use bulwark_config::{LogFormat, load_config};
 use bulwark_mcp::gateway::McpGateway;
 use bulwark_mcp::server::run_stdio_server;
+use bulwark_policy::engine::PolicyEngine;
+use bulwark_vault::store::Vault;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -49,11 +51,50 @@ pub fn start(config_path: &Path, log_level: Option<&str>) -> Result<()> {
         }
     }
 
+    let policies_dir = config.policy.policies_dir.clone();
+    let vault_config = config.vault.clone();
+
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async {
-        let gateway = McpGateway::new(config.mcp_gateway)
+        let mut gateway = McpGateway::new(config.mcp_gateway)
             .await
             .context("initialising MCP gateway")?;
+
+        // Load the policy engine if the policies directory exists.
+        let policies_path = Path::new(&policies_dir);
+        if policies_path.exists() {
+            match PolicyEngine::from_directory(policies_path) {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    tracing::info!(
+                        rules = engine.rule_count(),
+                        dir = %policies_path.display(),
+                        "policy engine loaded"
+                    );
+                    gateway = gateway.with_policy_engine(engine);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load policies, running without policy enforcement");
+                }
+            }
+        } else {
+            tracing::info!(dir = %policies_path.display(), "policies directory not found, running without policy enforcement");
+        }
+
+        // Load the vault if the key exists.
+        let key_path = bulwark_config::expand_tilde(&vault_config.key_path);
+        if Path::new(&key_path).exists() {
+            match Vault::open(&vault_config) {
+                Ok(vault) => {
+                    tracing::info!("vault loaded");
+                    gateway = gateway.with_vault(Arc::new(parking_lot::Mutex::new(vault)));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open vault, running without credential injection");
+                }
+            }
+        }
+
         let gateway = Arc::new(gateway);
 
         let shutdown = CancellationToken::new();
