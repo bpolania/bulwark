@@ -209,6 +209,13 @@ pub async fn forward_request(
         None
     };
 
+    // Capture content type before consuming the request.
+    let req_content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
     // Collect the request body so we can measure its size.
     let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
@@ -271,6 +278,50 @@ pub async fn forward_request(
     } else {
         body_bytes
     };
+
+    // Tier 2: HTTP callout analyzers (only if Tier 1 didn't block).
+    if let Some(ref pipeline) = ctx.http_analyzers {
+        let tier2_findings = pipeline
+            .analyze(
+                "outbound",
+                &body_bytes,
+                Some(&resolved_tool),
+                Some(&resolved_action),
+                req_content_type.as_deref(),
+                session.as_ref().map(|s| s.id.as_str()),
+                session.as_ref().map(|s| s.operator.as_str()),
+            )
+            .await;
+
+        if !tier2_findings.is_empty() {
+            let has_block = tier2_findings
+                .iter()
+                .any(|f| f.action == bulwark_inspect::FindingAction::Block);
+            if has_block {
+                tracing::warn!(
+                    host = %host,
+                    findings = tier2_findings.len(),
+                    "Tier 2 HTTP analyzer blocked request"
+                );
+                return Ok(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Request blocked by HTTP callout analyzer",
+                ));
+            }
+            // Merge Tier 2 findings into inspection info.
+            let existing_count = inspection_info
+                .as_ref()
+                .map(|ii| ii.finding_count)
+                .unwrap_or(0);
+            inspection_info = Some(bulwark_audit::event::InspectionInfo {
+                finding_count: existing_count + tier2_findings.len() as u64,
+                action_taken: "logged".to_string(),
+                max_severity: inspection_info
+                    .as_ref()
+                    .and_then(|ii| ii.max_severity.clone()),
+            });
+        }
+    }
 
     // Build the outbound request, stripping hop-by-hop and Bulwark-internal headers.
     let mut builder = Request::builder().method(parts.method).uri(&uri);

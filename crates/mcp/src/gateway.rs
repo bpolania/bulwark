@@ -9,6 +9,7 @@ use bulwark_audit::event::{
 use bulwark_audit::logger::AuditLogger;
 use bulwark_config::McpGatewayConfig;
 use bulwark_inspect::scanner::ContentScanner;
+use bulwark_inspect_http::HttpAnalyzerPipeline;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_ratelimit::cost::CostTracker;
 use bulwark_ratelimit::limiter::RateLimiter;
@@ -35,6 +36,7 @@ pub struct McpGateway {
     content_scanner: Option<Arc<ContentScanner>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     cost_tracker: Option<Arc<CostTracker>>,
+    http_analyzers: Option<Arc<HttpAnalyzerPipeline>>,
     /// Session token set by the agent (e.g. via an initialize param or header).
     session_token: parking_lot::Mutex<Option<String>>,
 }
@@ -59,6 +61,7 @@ impl McpGateway {
             content_scanner: None,
             rate_limiter: None,
             cost_tracker: None,
+            http_analyzers: None,
             session_token: parking_lot::Mutex::new(None),
         })
     }
@@ -76,6 +79,7 @@ impl McpGateway {
             content_scanner: None,
             rate_limiter: None,
             cost_tracker: None,
+            http_analyzers: None,
             session_token: parking_lot::Mutex::new(None),
         }
     }
@@ -113,6 +117,12 @@ impl McpGateway {
     /// Attach a cost tracker.
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.cost_tracker = Some(tracker);
+        self
+    }
+
+    /// Attach an HTTP analyzer pipeline for Tier 2 content inspection.
+    pub fn with_http_analyzers(mut self, pipeline: Arc<HttpAnalyzerPipeline>) -> Self {
+        self.http_analyzers = Some(pipeline);
         self
     }
 

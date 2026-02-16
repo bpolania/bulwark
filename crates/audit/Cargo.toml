@@ -20,3 +20,8 @@ blake3.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "audit_write"
+harness = false

@@ -130,6 +130,31 @@ pub fn start(
                         }
                     }
 
+                    // Verify audit hash chain integrity on startup.
+                    match bulwark_audit::store::AuditStore::open(Path::new(&audit_db_path)) {
+                        Ok(verify_store) => match verify_store.verify_chain() {
+                            Ok(result) if result.valid => {
+                                tracing::info!(
+                                    events_verified = result.events_checked,
+                                    "audit hash chain verified"
+                                );
+                            }
+                            Ok(result) => {
+                                tracing::error!(
+                                    first_invalid = result.first_invalid_index,
+                                    error = ?result.error,
+                                    "audit hash chain INVALID — log may have been tampered with"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "audit chain verification failed");
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to open audit store for chain verification");
+                        }
+                    }
+
                     server = server.with_audit_logger(logger.clone());
                     Some(logger)
                 }

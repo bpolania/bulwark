@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bulwark_audit::logger::AuditLogger;
 use bulwark_inspect::scanner::ContentScanner;
+use bulwark_inspect_http::HttpAnalyzerPipeline;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_ratelimit::cost::CostTracker;
 use bulwark_ratelimit::limiter::RateLimiter;
@@ -25,6 +26,7 @@ pub struct ProxyRequestContext {
     pub tool_mapper: Option<Arc<ToolMapper>>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub cost_tracker: Option<Arc<CostTracker>>,
+    pub http_analyzers: Option<Arc<HttpAnalyzerPipeline>>,
 }
 
 impl ProxyRequestContext {
@@ -37,6 +39,7 @@ impl ProxyRequestContext {
             tool_mapper: None,
             rate_limiter: None,
             cost_tracker: None,
+            http_analyzers: None,
         }
     }
 }

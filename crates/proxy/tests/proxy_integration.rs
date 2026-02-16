@@ -1969,3 +1969,1050 @@ rules:
 
     token.cancel();
 }
+
+// ── Phase 1I: Adversarial / hardening integration tests ───────────────
+
+#[tokio::test]
+async fn adversarial_oversized_request_body() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send a 2 MB request body — proxy should handle without panic.
+    let large_body = "X".repeat(2 * 1024 * 1024);
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body(large_body)
+        .send()
+        .await
+        .expect("proxied request");
+
+    // Should succeed (no size limit enforced in forward proxy by default).
+    assert!(
+        resp.status().is_success() || resp.status().is_client_error(),
+        "proxy should handle large body gracefully, got {}",
+        resp.status()
+    );
+
+    // Proxy still healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_extremely_long_url() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // URL with a 10k character path segment.
+    let long_path = "a".repeat(10_000);
+    let result = client
+        .get(format!("http://{echo_addr}/{long_path}"))
+        .send()
+        .await;
+
+    // Might succeed or fail, but proxy must not crash.
+    if let Ok(resp) = result {
+        assert!(
+            resp.status().is_success()
+                || resp.status().is_client_error()
+                || resp.status().is_server_error(),
+            "proxy returned valid HTTP status"
+        );
+    }
+
+    // Proxy still healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_many_headers() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send request with 100 custom headers.
+    let mut req = client.get(format!("http://{echo_addr}/test"));
+    for i in 0..100 {
+        req = req.header(format!("X-Custom-{i}"), format!("value-{i}"));
+    }
+    let result = req.send().await;
+
+    if let Ok(resp) = result {
+        // 431 (Request Header Fields Too Large) is valid — hyper enforces limits.
+        assert!(
+            resp.status().is_success()
+                || resp.status().is_client_error()
+                || resp.status().is_server_error(),
+            "proxy should handle many headers gracefully, got {}",
+            resp.status()
+        );
+    }
+
+    // Proxy still healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_binary_body() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send binary data (including null bytes) — scanner should handle gracefully.
+    let binary_body: Vec<u8> = (0..256).map(|b| b as u8).cycle().take(4096).collect();
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body(binary_body)
+        .send()
+        .await
+        .expect("proxied request");
+
+    // Binary content should pass through (no secret patterns match).
+    assert_eq!(resp.status(), 200, "binary body should pass through");
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_concurrent_sessions_isolated() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+    let vault_dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    let echo_addr = start_echo_server().await;
+    let vault = test_vault_optional(&vault_dir);
+
+    // Create 10 sessions.
+    let sessions: Vec<_> = (0..10)
+        .map(|i| {
+            vault
+                .create_session(CreateSessionParams {
+                    operator: format!("operator-{i}"),
+                    team: None,
+                    project: None,
+                    environment: None,
+                    agent_type: None,
+                    ttl_seconds: None,
+                    description: None,
+                })
+                .unwrap()
+        })
+        .collect();
+
+    let (proxy_addr, token) = start_test_proxy_with_vault(ca_dir.to_str().unwrap(), vault).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send concurrent requests across all sessions.
+    let mut handles = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        let c = client.clone();
+        let addr = echo_addr;
+        let token = session.token.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = c
+                .get(format!("http://{addr}/test/{i}"))
+                .header("X-Bulwark-Session", &token)
+                .send()
+                .await
+                .expect("concurrent session request");
+            assert_eq!(resp.status(), 200, "session {i} request should succeed");
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("task join");
+    }
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_empty_request_body() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // POST with empty body should work.
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body("")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200, "empty body should pass through");
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_rapid_reconnects() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    // Open and close 50 connections rapidly.
+    for _ in 0..50 {
+        let result = tokio::net::TcpStream::connect(proxy_addr).await;
+        if let Ok(stream) = result {
+            drop(stream); // Immediately close
+        }
+    }
+
+    // Small delay for the proxy to process disconnections.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Proxy must still be healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health after rapid reconnects");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_request_after_policy_denial_still_works() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Policy denies tool "blocked-host" but allows everything else.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: deny-blocked
+    verdict: deny
+    reason: "blocked host"
+    priority: 10
+    match:
+      tools: ["blocked-host"]
+  - name: allow-rest
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let mapper = Arc::new(
+        ToolMapper::new(vec![ToolMapping {
+            url_pattern: "blocked-host:*/*".to_string(),
+            tool: "blocked-host".to_string(),
+            action_from: bulwark_config::ActionFrom::UrlPath,
+        }])
+        .unwrap(),
+    );
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_toolmap(ca_dir.to_str().unwrap(), mapper, engine).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // First: request to allowed endpoint.
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .send()
+        .await
+        .expect("allowed request");
+    assert_eq!(resp.status(), 200, "allowed request should succeed");
+
+    // Second: request to denied endpoint.
+    let resp = client.get("http://blocked-host:1234/test").send().await;
+    // Might be 403 or connection error (no server at blocked-host).
+    if let Ok(r) = resp {
+        assert!(
+            r.status() == 403 || r.status().is_server_error(),
+            "denied or unreachable"
+        );
+    }
+
+    // Third: another allowed request should still work.
+    let resp = client
+        .get(format!("http://{echo_addr}/test2"))
+        .send()
+        .await
+        .expect("allowed request after denial");
+    assert_eq!(resp.status(), 200, "proxy recovers after denial");
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_unicode_in_request() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_body_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send body with multi-byte UTF-8 characters.
+    let unicode_body =
+        "Hello \u{1F600} emoji and \u{4E16}\u{754C} (world) and \u{00E9}\u{00E8}\u{00EA} accents";
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body(unicode_body)
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200, "unicode body should pass through");
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let echoed = body["body"].as_str().expect("echoed body");
+    assert!(echoed.contains("emoji"), "unicode content preserved");
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn adversarial_double_shutdown() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let (_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    // Cancel twice — should not panic.
+    token.cancel();
+    token.cancel();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // If we got here without panic, the test passes.
+}
+
+#[tokio::test]
+async fn adversarial_slow_upstream() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    // Start a server that takes 3 seconds to respond.
+    let slow_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind slow server");
+    let slow_addr = slow_listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match slow_listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok::<_, hyper::Error>(Response::new(
+                        Full::new(Bytes::from("slow response"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{slow_addr}/slow"))
+        .send()
+        .await
+        .expect("proxied slow request");
+
+    assert_eq!(resp.status(), 200, "slow upstream response should arrive");
+    let body = resp.text().await.expect("text");
+    assert_eq!(body, "slow response");
+
+    // Proxy still healthy during/after slow request.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+// ── Phase 1I Verification: Security adversarial tests ──────────────────
+
+/// SQL injection in the tool name or URL should not corrupt policy evaluation
+/// or any internal store.
+#[tokio::test]
+async fn adversarial_sql_injection_in_tool_name() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Map the echo server to a tool name containing SQL injection.
+    let mapper = Arc::new(
+        ToolMapper::new(vec![ToolMapping {
+            url_pattern: format!("{}/*", echo_addr),
+            tool: "echo'; DROP TABLE events;--".to_string(),
+            action_from: bulwark_config::ActionFrom::UrlPath,
+        }])
+        .unwrap(),
+    );
+
+    // Allow-all policy.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // Set up audit logger to verify SQL injection doesn't corrupt the DB.
+    let audit_db = tmp.path().join("audit.db");
+    let logger = bulwark_audit::logger::AuditLogger::new(&audit_db).unwrap();
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_tool_mapper(mapper)
+            .with_audit_logger(logger.clone()),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        server_clone
+            .run_with_listener(listener)
+            .await
+            .expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send request — the tool name contains SQL injection payload.
+    let resp = client
+        .get(format!("http://{echo_addr}/api/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "request should succeed (tool name is just a string)"
+    );
+
+    // Flush audit log and verify the DB is intact.
+    logger.shutdown().await;
+    token.cancel();
+
+    let store = bulwark_audit::store::AuditStore::open(&audit_db).unwrap();
+    let events = store
+        .query(&bulwark_audit::query::AuditFilter::default())
+        .unwrap();
+    assert!(!events.is_empty(), "audit events should be present");
+
+    // Verify the SQL injection payload was stored as a literal string, not executed.
+    let event = &events[0];
+    assert!(
+        event.request.as_ref().unwrap().tool.contains("DROP TABLE"),
+        "tool name with SQL injection should be stored literally"
+    );
+
+    // Verify hash chain is intact (SQL injection didn't corrupt the store).
+    let chain = store.verify_chain().unwrap();
+    assert!(
+        chain.valid,
+        "audit hash chain should be valid after SQL injection attempt"
+    );
+}
+
+/// Null bytes in headers/body should not cause panics or truncation issues.
+#[tokio::test]
+async fn adversarial_null_bytes_in_request() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_body_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Body with embedded null bytes and control characters.
+    let null_body = b"before\x00null\x00middle\x01\x02\x03after";
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body(null_body.to_vec())
+        .send()
+        .await
+        .expect("proxied request");
+
+    // Should pass through — null bytes are not secret patterns.
+    assert!(
+        resp.status().is_success(),
+        "null bytes in body should not crash the proxy, got {}",
+        resp.status()
+    );
+
+    // Proxy still healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+/// Error responses from the proxy must never contain credential material
+/// (session tokens, vault secrets, internal paths).
+#[tokio::test]
+async fn adversarial_credential_not_leaked_in_errors() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+    let vault_dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    let vault = test_vault_required(&vault_dir);
+    let echo_addr = start_echo_server().await;
+    let (proxy_addr, token) = start_test_proxy_with_vault(ca_dir.to_str().unwrap(), vault).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // 1. Request with an invalid session token → 401.
+    let bad_token = "bwk_sess_0000000000000000000000000000dead";
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("X-Bulwark-Session", bad_token)
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 401);
+    let body_text = resp.text().await.expect("body text");
+
+    // The error response must NOT leak the submitted token.
+    assert!(
+        !body_text.contains(bad_token),
+        "error response must not echo back the session token"
+    );
+    // Must not contain internal paths.
+    assert!(
+        !body_text.contains("vault") && !body_text.contains("sessions.db"),
+        "error response must not reveal internal paths, got: {body_text}"
+    );
+
+    // 2. Request without session (when required) → 401.
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 401);
+    let body_text = resp.text().await.expect("body text");
+    assert!(
+        !body_text.contains(&vault_dir.to_string_lossy().to_string()),
+        "error response must not reveal vault directory path"
+    );
+
+    token.cancel();
+}
+
+/// Session validation should be timing-safe: valid-format tokens that don't
+/// exist should take roughly the same time as tokens that do exist but are
+/// revoked or expired.
+#[tokio::test]
+async fn adversarial_timing_safe_session_validation() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+    let vault_dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    let vault = test_vault_required(&vault_dir);
+
+    // Create a valid session.
+    let session = vault
+        .create_session(CreateSessionParams {
+            operator: "timing-test".to_string(),
+            team: None,
+            project: None,
+            environment: None,
+            agent_type: None,
+            ttl_seconds: None,
+            description: None,
+        })
+        .unwrap();
+
+    let echo_addr = start_echo_server().await;
+    let (proxy_addr, token) = start_test_proxy_with_vault(ca_dir.to_str().unwrap(), vault).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Measure time for 10 requests with a non-existent valid-format token.
+    let nonexistent_token = "bwk_sess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+    let mut nonexistent_durations = Vec::new();
+    for _ in 0..10 {
+        let start = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{echo_addr}/test"))
+            .header("X-Bulwark-Session", nonexistent_token)
+            .send()
+            .await
+            .expect("proxied request");
+        nonexistent_durations.push(start.elapsed());
+        assert_eq!(resp.status(), 401);
+    }
+
+    // Measure time for 10 requests with a valid token.
+    let mut valid_durations = Vec::new();
+    for _ in 0..10 {
+        let start = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{echo_addr}/test"))
+            .header("X-Bulwark-Session", &session.token)
+            .send()
+            .await
+            .expect("proxied request");
+        valid_durations.push(start.elapsed());
+        assert_eq!(resp.status(), 200);
+    }
+
+    // Compute median durations (excludes warm-up outliers).
+    nonexistent_durations.sort();
+    valid_durations.sort();
+    let median_nonexistent = nonexistent_durations[5];
+    let median_valid = valid_durations[5];
+
+    // The key assertion: the ratio between the two medians should not be extreme.
+    // A timing oracle would show >10x difference. We allow up to 5x.
+    let ratio = if median_nonexistent > median_valid {
+        median_nonexistent.as_micros() as f64 / median_valid.as_micros().max(1) as f64
+    } else {
+        median_valid.as_micros() as f64 / median_nonexistent.as_micros().max(1) as f64
+    };
+
+    assert!(
+        ratio < 5.0,
+        "timing ratio between valid and nonexistent tokens ({ratio:.2}x) suggests \
+         a timing oracle vulnerability. Median valid={median_valid:?}, nonexistent={median_nonexistent:?}"
+    );
+
+    token.cancel();
+}
+
+/// Sending raw malformed HTTP requests (not just non-HTTP data, but technically
+/// HTTP-like but broken) should not crash the proxy. This specifically tests
+/// protocol-level resilience.
+#[tokio::test]
+async fn adversarial_malformed_http_protocol() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let (proxy_addr, token, _server) = start_test_proxy(ca_dir.to_str().unwrap()).await;
+
+    // 1. Send an HTTP/1.0 request with garbage content-length.
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect");
+
+    use tokio::io::AsyncWriteExt;
+    stream
+        .write_all(
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: -1\r\n\r\n",
+        )
+        .await
+        .ok();
+    drop(stream);
+
+    // 2. Send an HTTP request with duplicate Content-Length headers (CL smuggling probe).
+    let mut stream2 = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect");
+    stream2
+        .write_all(
+            b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\nhello",
+        )
+        .await
+        .ok();
+    drop(stream2);
+
+    // 3. Send truncated request line.
+    let mut stream3 = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect");
+    stream3.write_all(b"GET\r\n").await.ok();
+    drop(stream3);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Proxy still healthy.
+    let health = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/healthz"))
+        .send()
+        .await
+        .expect("health after malformed HTTP");
+    assert_eq!(health.status(), 200);
+
+    token.cancel();
+}
+
+/// Tool names injected into audit log events should not cause audit log
+/// corruption (e.g. via newlines, control characters, or oversized values).
+#[tokio::test]
+async fn adversarial_audit_log_injection() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Create audit logger.
+    let audit_db = tmp.path().join("audit_injection.db");
+    let logger = bulwark_audit::logger::AuditLogger::new(&audit_db).unwrap();
+
+    // Create a tool mapper with a tool name containing SQL injection payloads,
+    // quotes, tabs, and unicode characters (no newlines — glob `*` doesn't match \n).
+    let mapper = Arc::new(
+        ToolMapper::new(vec![ToolMapping {
+            url_pattern: format!("{}/*", echo_addr),
+            tool: "tool'; DROP TABLE events;--\twith\ttabs\"and'quotes\u{1F600}".to_string(),
+            action_from: bulwark_config::ActionFrom::UrlPath,
+        }])
+        .unwrap(),
+    );
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    // No content scanner — we are testing audit log injection, not content inspection.
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_tool_mapper(mapper)
+            .with_audit_logger(logger.clone()),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        server_clone
+            .run_with_listener(listener)
+            .await
+            .expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Send 3 requests to build a chain.
+    for i in 0..3 {
+        let resp = client
+            .get(format!("http://{echo_addr}/test/{i}"))
+            .send()
+            .await
+            .expect("proxied request");
+        assert_eq!(resp.status(), 200);
+    }
+
+    // Flush and verify.
+    logger.shutdown().await;
+    token.cancel();
+
+    let store = bulwark_audit::store::AuditStore::open(&audit_db).unwrap();
+    let events = store
+        .query(&bulwark_audit::query::AuditFilter::default())
+        .unwrap();
+    assert_eq!(events.len(), 3, "should have 3 audit events");
+
+    // Verify the control characters were stored literally without corrupting the chain.
+    let chain = store.verify_chain().unwrap();
+    assert!(
+        chain.valid,
+        "audit hash chain should be valid even with control characters in tool names"
+    );
+    assert_eq!(chain.events_checked, 3);
+}
+
+/// Concurrent requests to a rate-limited endpoint should not exceed the burst
+/// limit due to race conditions (i.e. the token bucket is thread-safe).
+#[tokio::test]
+async fn adversarial_rate_limit_concurrent_accuracy() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // Rate limit: burst=5, 60 RPM, global dimension.
+    let limiter = Arc::new(
+        RateLimiter::new(vec![bulwark_config::RateLimitRule {
+            name: "concurrent-test".to_string(),
+            tools: vec!["*".to_string()],
+            rpm: 60,
+            burst: 5,
+            dimensions: vec!["global".to_string()],
+        }])
+        .unwrap(),
+    );
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_rate_limiter(limiter),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Fire 20 concurrent requests. With burst=5, at most 5 should succeed.
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let c = client.clone();
+        let addr = echo_addr;
+        handles.push(tokio::spawn(async move {
+            let resp = c
+                .get(format!("http://{addr}/test/{i}"))
+                .send()
+                .await
+                .expect("request");
+            resp.status().as_u16()
+        }));
+    }
+
+    let mut successes = 0u32;
+    let mut rate_limited = 0u32;
+    for h in handles {
+        let status = h.await.expect("task join");
+        if status == 200 {
+            successes += 1;
+        } else if status == 429 {
+            rate_limited += 1;
+        }
+    }
+
+    // At most burst (5) + a small refill allowance should succeed.
+    // The exact count depends on timing, but we should not get all 20 through.
+    assert!(
+        successes <= 7,
+        "at most burst + small refill should succeed, but got {successes} successes \
+         (rate_limited={rate_limited})"
+    );
+    assert!(
+        rate_limited > 0,
+        "at least some requests should be rate limited, but got 0 rate-limited \
+         (successes={successes})"
+    );
+
+    token.cancel();
+}

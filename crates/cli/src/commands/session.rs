@@ -54,6 +54,12 @@ pub fn create(
     println!("Give the token to the agent. Set it as:");
     println!("  HTTP: X-Bulwark-Session: {}", session.token);
     println!("  MCP:  via initialize params");
+    println!();
+    println!("To trust the Bulwark CA certificate:");
+    println!("  Node.js: export NODE_EXTRA_CA_CERTS=\"$(bulwark ca path)\"");
+    println!("  Python:  export REQUESTS_CA_BUNDLE=\"$(bulwark ca path)\"");
+    println!("  OpenSSL: export SSL_CERT_FILE=\"$(bulwark ca path)\"");
+    println!("  curl:    curl --cacert \"$(bulwark ca path)\" ...");
 
     Ok(())
 }

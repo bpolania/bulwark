@@ -14,6 +14,7 @@ bulwark-vault.workspace = true
 bulwark-audit.workspace = true
 bulwark-inspect.workspace = true
 bulwark-ratelimit.workspace = true
+bulwark-inspect-http.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

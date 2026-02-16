@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use bulwark_audit::logger::AuditLogger;
 use bulwark_config::ProxyConfig;
 use bulwark_inspect::scanner::ContentScanner;
+use bulwark_inspect_http::HttpAnalyzerPipeline;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_ratelimit::cost::CostTracker;
 use bulwark_ratelimit::limiter::RateLimiter;
@@ -88,6 +89,12 @@ impl ProxyServer {
     /// Attach a cost tracker.
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.ctx.cost_tracker = Some(tracker);
+        self
+    }
+
+    /// Attach an HTTP analyzer pipeline for Tier 2 content inspection.
+    pub fn with_http_analyzers(mut self, pipeline: Arc<HttpAnalyzerPipeline>) -> Self {
+        self.ctx.http_analyzers = Some(pipeline);
         self
     }
 

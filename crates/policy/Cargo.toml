@@ -20,3 +20,8 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "policy_evaluation"
+harness = false

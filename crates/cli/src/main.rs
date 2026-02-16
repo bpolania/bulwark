@@ -98,6 +98,8 @@ enum Commands {
 enum CaAction {
     /// Print the CA certificate PEM to stdout.
     Export,
+    /// Print the absolute path to the CA certificate PEM file.
+    Path,
 }
 
 #[derive(Subcommand)]
@@ -320,6 +322,7 @@ fn main() -> Result<()> {
         Commands::Init { path } => commands::init::run(path.as_deref()),
         Commands::Ca { action } => match action {
             CaAction::Export => commands::ca::export(&cli.config),
+            CaAction::Path => commands::ca::path(&cli.config),
         },
         Commands::Mcp { action } => match action {
             McpAction::Start => commands::mcp::start(&cli.config, cli.log_level.as_deref()),

@@ -19,6 +19,7 @@ bulwark-policy.workspace = true
 bulwark-vault.workspace = true
 bulwark-audit.workspace = true
 bulwark-inspect.workspace = true
+bulwark-inspect-http.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 clap.workspace = true

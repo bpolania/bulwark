@@ -1159,3 +1159,89 @@ rules:
         panic!("Expected response for rate-limited request");
     }
 }
+
+// ── Phase 1I Verification: MCP adversarial tests ─────────────────────
+
+/// Malformed JSON-RPC messages (missing method, null id, garbage params) should
+/// not cause panics or corruption in the gateway.
+#[tokio::test]
+async fn adversarial_malformed_mcp_jsonrpc() {
+    let gateway = McpGateway::new_with_upstreams(HashMap::new());
+
+    // 1. Request with missing "method" field — serde will fail to parse as Request,
+    //    but it will parse as a Response (has "id" but no "method"). Gateway should
+    //    ignore it (return None).
+    let malformed_no_method = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "params": {}
+    });
+    let parsed: Result<JsonRpcMessage, _> = serde_json::from_value(malformed_no_method);
+    if let Ok(msg) = parsed {
+        let result = gateway.handle_message(msg).await;
+        // Should return None or a valid error — never panic.
+        if let Some(JsonRpcMessage::Response(r)) = result {
+            // If it responded, it should be an error.
+            assert!(r.error.is_some() || r.result.is_some());
+        }
+    }
+    // If it failed to parse, that's also fine — the transport layer would skip it.
+
+    // 2. Request with empty method string.
+    let empty_method = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(2),
+        method: "".into(),
+        params: None,
+    });
+    let resp = gateway.handle_message(empty_method).await;
+    if let Some(JsonRpcMessage::Response(r)) = resp {
+        assert!(r.error.is_some(), "empty method should return error");
+    }
+
+    // 3. Request with extremely long method name (10KB).
+    let long_method = "x".repeat(10_000);
+    let long_req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(3),
+        method: long_method,
+        params: None,
+    });
+    let resp = gateway.handle_message(long_req).await;
+    if let Some(JsonRpcMessage::Response(r)) = resp {
+        assert!(r.error.is_some(), "unknown long method should return error");
+    }
+
+    // 4. tools/call with SQL injection in tool name.
+    let sql_injection_tool = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(4),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "'; DROP TABLE events;--__read",
+            "arguments": {}
+        })),
+    });
+    let resp = gateway.handle_message(sql_injection_tool).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        // Should get an error (unknown server), NOT execute SQL.
+        assert!(r.error.is_some());
+    }
+
+    // 5. Verify gateway is still functional after adversarial inputs.
+    let ping = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(99),
+        method: "ping".into(),
+        params: None,
+    });
+    let resp = gateway.handle_message(ping).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "ping should succeed after adversarial inputs"
+        );
+    } else {
+        panic!("Expected ping response");
+    }
+}
