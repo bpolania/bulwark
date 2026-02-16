@@ -6,8 +6,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::event::{
-    AuditEvent, Channel, CredentialInfo, ErrorInfo, EventOutcome, EventType, PolicyInfo,
-    RequestInfo, SessionInfo,
+    AuditEvent, Channel, CredentialInfo, ErrorInfo, EventOutcome, EventType, InspectionInfo,
+    PolicyInfo, RequestInfo, SessionInfo,
 };
 use crate::query::{AuditFilter, AuditStats};
 
@@ -66,6 +66,9 @@ impl AuditStore {
                 binding_tool_pattern TEXT,
                 error_category TEXT,
                 error_message TEXT,
+                inspection_finding_count INTEGER,
+                inspection_action TEXT,
+                inspection_max_severity TEXT,
                 duration_us INTEGER,
                 event_hash TEXT,
                 prev_hash TEXT
@@ -254,6 +257,7 @@ impl AuditStore {
                 verdict, matched_rule, matched_policy, policy_scope, reason, evaluation_time_us,
                 credential_name, credential_type, binding_tool_pattern,
                 error_category, error_message,
+                inspection_finding_count, inspection_action, inspection_max_severity,
                 duration_us,
                 event_hash, prev_hash
             ) VALUES (
@@ -263,8 +267,9 @@ impl AuditStore {
                 ?16, ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24,
                 ?25, ?26,
-                ?27,
-                ?28, ?29
+                ?27, ?28, ?29,
+                ?30,
+                ?31, ?32
             )",
             rusqlite::params![
                 event.id,
@@ -299,6 +304,12 @@ impl AuditStore {
                     .and_then(|c| c.binding_tool_pattern.as_ref()),
                 event.error.as_ref().map(|e| &e.category),
                 event.error.as_ref().map(|e| &e.message),
+                event.inspection.as_ref().map(|i| i.finding_count as i64),
+                event.inspection.as_ref().map(|i| &i.action_taken),
+                event
+                    .inspection
+                    .as_ref()
+                    .and_then(|i| i.max_severity.as_ref()),
                 event.duration_us.map(|d| d as i64),
                 event_hash,
                 prev_hash,
@@ -388,6 +399,16 @@ impl AuditStore {
                 .unwrap_or_default(),
         });
 
+        let inspection_action: Option<String> = row.get("inspection_action")?;
+        let inspection = inspection_action.map(|action| InspectionInfo {
+            finding_count: row
+                .get::<_, Option<i64>>("inspection_finding_count")
+                .unwrap_or(None)
+                .unwrap_or(0) as u64,
+            action_taken: action,
+            max_severity: row.get("inspection_max_severity").unwrap_or(None),
+        });
+
         let duration_us: Option<i64> = row.get("duration_us")?;
         let event_hash: Option<String> = row.get("event_hash")?;
         let prev_hash: Option<String> = row.get("prev_hash")?;
@@ -403,6 +424,7 @@ impl AuditStore {
             policy,
             credential,
             error,
+            inspection,
             duration_us: duration_us.map(|d| d as u64),
             event_hash,
             prev_hash,

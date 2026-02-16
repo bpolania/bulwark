@@ -26,6 +26,8 @@ pub struct AuditEvent {
     pub credential: Option<CredentialInfo>,
     /// Error information (if the event represents an error).
     pub error: Option<ErrorInfo>,
+    /// Content inspection information (if inspection occurred).
+    pub inspection: Option<InspectionInfo>,
     /// Wall-clock duration of the operation in microseconds.
     pub duration_us: Option<u64>,
     /// Blake3 hash of this event (computed at insert time for tamper detection).
@@ -153,6 +155,17 @@ pub struct ErrorInfo {
     pub message: String,
 }
 
+/// Content inspection information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectionInfo {
+    /// Number of findings.
+    pub finding_count: u64,
+    /// Action taken: "blocked", "redacted", or "logged".
+    pub action_taken: String,
+    /// Maximum severity found (if any).
+    pub max_severity: Option<String>,
+}
+
 impl AuditEvent {
     /// Start building an event.
     pub fn builder(event_type: EventType, channel: Channel) -> AuditEventBuilder {
@@ -168,6 +181,7 @@ impl AuditEvent {
                 policy: None,
                 credential: None,
                 error: None,
+                inspection: None,
                 duration_us: None,
                 event_hash: None,
                 prev_hash: None,
@@ -215,6 +229,12 @@ impl AuditEventBuilder {
     /// Attach error information.
     pub fn error(mut self, info: ErrorInfo) -> Self {
         self.event.error = Some(info);
+        self
+    }
+
+    /// Attach content inspection information.
+    pub fn inspection(mut self, info: InspectionInfo) -> Self {
+        self.event.inspection = Some(info);
         self
     }
 

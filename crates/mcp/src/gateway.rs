@@ -425,7 +425,12 @@ impl McpGateway {
 
         // Inspect request arguments for sensitive content.
         let mut request_inspection = bulwark_inspect::InspectionResult::empty(0);
-        if let Some(ref scanner) = self.content_scanner {
+        let mut final_arguments = params.arguments.clone();
+        if let Some(scanner) = self
+            .content_scanner
+            .as_ref()
+            .filter(|s| s.inspect_requests())
+        {
             if let Some(ref args) = params.arguments {
                 request_inspection = scanner.scan_json(args);
                 if request_inspection.should_block {
@@ -461,6 +466,18 @@ impl McpGateway {
                         "Request blocked by content inspection".to_string(),
                     );
                 }
+
+                // Redact request arguments before forwarding.
+                if request_inspection.should_redact {
+                    tracing::info!(
+                        finding_count = request_inspection.findings.len(),
+                        "redacting tool call arguments"
+                    );
+                    final_arguments = Some(bulwark_inspect::redact_json(
+                        args,
+                        &request_inspection.findings,
+                    ));
+                }
             }
         }
 
@@ -476,9 +493,9 @@ impl McpGateway {
             }
         };
 
-        // Forward to upstream.
+        // Forward to upstream with (possibly redacted) arguments.
         let mut server = upstream.lock().await;
-        let result = server.call_tool(tool_name, params.arguments).await;
+        let result = server.call_tool(tool_name, final_arguments).await;
         let duration_us = start.elapsed().as_micros() as u64;
         let latency_ms = duration_us as f64 / 1000.0;
 
@@ -494,8 +511,13 @@ impl McpGateway {
 
                 // Inspect response content.
                 let mut response_inspection = bulwark_inspect::InspectionResult::empty(0);
-                if let Some(ref scanner) = self.content_scanner {
-                    let result_json = serde_json::to_value(&tool_result).unwrap_or_default();
+                let mut result_json = serde_json::to_value(&tool_result).unwrap_or_default();
+                let mut response_was_redacted = false;
+                if let Some(scanner) = self
+                    .content_scanner
+                    .as_ref()
+                    .filter(|s| s.inspect_responses())
+                {
                     response_inspection = scanner.scan_json(&result_json);
                     if !response_inspection.findings.is_empty() {
                         tracing::info!(
@@ -504,6 +526,56 @@ impl McpGateway {
                             redacted = response_inspection.should_redact,
                             "Content inspection findings in response"
                         );
+                    }
+
+                    // Block response if critical findings.
+                    if response_inspection.should_block {
+                        tracing::warn!(
+                            tool = %params.name,
+                            findings = response_inspection.findings.len(),
+                            "Content inspection blocked response"
+                        );
+
+                        if let Some(ref logger) = self.audit_logger {
+                            let mut builder = AuditEvent::builder(
+                                EventType::RequestProcessed,
+                                Channel::McpGateway,
+                            )
+                            .outcome(EventOutcome::Denied)
+                            .request(RequestInfo {
+                                tool: server_name.to_string(),
+                                action: tool_name.to_string(),
+                                resource: None,
+                                target: params.name.clone(),
+                            })
+                            .duration_us(start.elapsed().as_micros() as u64);
+                            if let Some(ref si) = audit_session {
+                                builder = builder.session(si.clone());
+                            }
+                            if let Some(ref pi) = policy_info {
+                                builder = builder.policy(pi.clone());
+                            }
+                            logger.log(builder.build());
+                        }
+
+                        return JsonRpcResponse::error(
+                            req.id.clone(),
+                            CONTENT_BLOCKED,
+                            "Response blocked: upstream returned dangerous content".to_string(),
+                        );
+                    }
+
+                    // Redact response content if needed.
+                    if response_inspection.should_redact {
+                        tracing::info!(
+                            finding_count = response_inspection.findings.len(),
+                            "redacting tool response content"
+                        );
+                        result_json = bulwark_inspect::redact_json(
+                            &result_json,
+                            &response_inspection.findings,
+                        );
+                        response_was_redacted = true;
                     }
                 }
 
@@ -540,8 +612,8 @@ impl McpGateway {
                     None
                 };
 
-                // Attach governance metadata.
-                let mut result_value = serde_json::to_value(&tool_result).unwrap();
+                // Attach governance metadata using the (possibly redacted) result.
+                let mut result_value = result_json;
                 if let Some(obj) = result_value.as_object_mut() {
                     let mut meta = if let Some(engine) = &self.policy_engine {
                         use bulwark_policy::context::RequestContext;
@@ -575,9 +647,10 @@ impl McpGateway {
                             let any_blocked = all_findings
                                 .iter()
                                 .any(|f| f.action == bulwark_inspect::FindingAction::Block);
-                            let any_redacted = all_findings
-                                .iter()
-                                .any(|f| f.action == bulwark_inspect::FindingAction::Redact);
+                            let any_redacted = response_was_redacted
+                                || all_findings
+                                    .iter()
+                                    .any(|f| f.action == bulwark_inspect::FindingAction::Redact);
                             gov["inspection_results"] = serde_json::json!({
                                 "finding_count": all_findings.len(),
                                 "max_severity": serde_json::to_value(max_sev).unwrap_or_default(),

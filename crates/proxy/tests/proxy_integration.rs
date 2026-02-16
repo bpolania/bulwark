@@ -1108,6 +1108,413 @@ rules:
     token.cancel();
 }
 
+/// Start an echo HTTP server that echoes back the request body.
+/// Returns the bound address.
+async fn start_body_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind body echo server");
+    let addr = listener.local_addr().expect("echo addr");
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let method = req.method().to_string();
+                    let path = req.uri().path().to_string();
+
+                    // Collect the request body.
+                    let body_bytes = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+
+                    let resp = serde_json::json!({
+                        "method": method,
+                        "path": path,
+                        "body": body_str,
+                    });
+
+                    Ok::<_, hyper::Error>(Response::new(
+                        Full::new(Bytes::from(resp.to_string()))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                });
+
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn proxy_redacts_request_body() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_body_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // POST a body containing a bearer token — should be redacted, not blocked.
+    let bearer_token = "token: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.padding_to_make_it_long_enough_for_detection";
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body(bearer_token)
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "bearer token should be redacted, not blocked"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let echoed_body = body["body"].as_str().expect("echoed body");
+
+    assert!(
+        echoed_body.contains("[REDACTED]"),
+        "echoed body should contain [REDACTED], got: {echoed_body}"
+    );
+    assert!(
+        !echoed_body.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "echoed body should NOT contain the original token, got: {echoed_body}"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_block_still_works_after_redaction_wiring() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_body_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // POST a body containing an AWS access key — should be blocked (not redacted).
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body("key: AKIAIOSFODNN7EXAMPLE")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "AWS key should be blocked, not redacted"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("content inspection"),
+        "error should mention content inspection, got: {body}",
+    );
+
+    token.cancel();
+}
+
+/// Start a mock HTTP server that returns a fixed response body for every request.
+async fn start_fixed_response_server(response_body: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixed response server");
+    let addr = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+                    let body = response_body;
+                    async move {
+                        Ok::<_, hyper::Error>(Response::new(
+                            Full::new(Bytes::from(body))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        ))
+                    }
+                });
+
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn proxy_blocks_dangerous_response() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    // Mock upstream returns an AWS key in its response body.
+    let upstream_addr = start_fixed_response_server("secret_key = AKIAIOSFODNN7EXAMPLE").await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{upstream_addr}/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        502,
+        "dangerous upstream response should be blocked with 502"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("upstream returned dangerous content"),
+        "error should mention dangerous content, got: {body}",
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_redacts_response_body() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    // Mock upstream returns a bearer token (action: Redact) in its response.
+    let upstream_addr = start_fixed_response_server(
+        "output: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.padding_long_enough_for_detection",
+    )
+    .await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{upstream_addr}/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "bearer token in response should be redacted, not blocked"
+    );
+
+    let body_text = resp.text().await.expect("response text");
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "response should contain [REDACTED], got: {body_text}"
+    );
+    assert!(
+        !body_text.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "response should NOT contain original bearer token, got: {body_text}"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_passes_clean_response() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/test?q=hello"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200, "clean response should pass through");
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["method"], "GET");
+    assert_eq!(body["path"], "/test");
+
+    // Verify no [REDACTED] markers in the clean response.
+    let body_str = serde_json::to_string(&body).unwrap();
+    assert!(
+        !body_str.contains("[REDACTED]"),
+        "clean response should have no [REDACTED] markers"
+    );
+
+    token.cancel();
+}
+
+/// Start a Bulwark proxy with a content scanner built from a custom config.
+async fn start_test_proxy_with_scanner_config(
+    ca_dir: &str,
+    scanner: Arc<bulwark_inspect::scanner::ContentScanner>,
+) -> (SocketAddr, CancellationToken) {
+    // Reuse existing helper — scanner config flags are on the scanner itself.
+    start_test_proxy_with_scanner(ca_dir, scanner).await
+}
+
+#[tokio::test]
+async fn proxy_skips_response_inspection_when_disabled() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    // Mock upstream returns an AWS key — normally would be blocked.
+    let upstream_addr = start_fixed_response_server("secret_key = AKIAIOSFODNN7EXAMPLE").await;
+
+    // Create scanner with inspect_responses disabled.
+    let config = bulwark_inspect::InspectionConfig {
+        inspect_responses: false,
+        ..Default::default()
+    };
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::from_config(&config).unwrap());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner_config(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{upstream_addr}/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    // Response inspection disabled — should pass through, not 502.
+    assert_eq!(
+        resp.status(),
+        200,
+        "response inspection disabled, should pass through"
+    );
+
+    let body_text = resp.text().await.expect("response text");
+    assert!(
+        body_text.contains("AKIAIOSFODNN7EXAMPLE"),
+        "AWS key should pass through when response inspection disabled"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_skips_request_inspection_when_disabled() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    // Use regular echo server (not body echo) to avoid the AWS key appearing in the response.
+    let echo_addr = start_echo_server().await;
+
+    // Create scanner with inspect_requests disabled.
+    let config = bulwark_inspect::InspectionConfig {
+        inspect_requests: false,
+        ..Default::default()
+    };
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::from_config(&config).unwrap());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner_config(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // POST a body with an AWS key — normally would be blocked (403).
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body("key: AKIAIOSFODNN7EXAMPLE")
+        .send()
+        .await
+        .expect("proxied request");
+
+    // Request inspection disabled — should pass through, not 403.
+    assert_eq!(
+        resp.status(),
+        200,
+        "request inspection disabled, should pass through"
+    );
+
+    token.cancel();
+}
+
 #[tokio::test]
 async fn https_connect_tunnel() {
     // This test verifies the CONNECT tunnel works with the local CA.

@@ -316,8 +316,13 @@ async fn forward_tls_request(
     };
     let request_bytes = body_bytes.len() as u64;
 
-    // Inspect request body if scanner is configured.
-    if let Some(ref scanner) = ctx.content_scanner {
+    // Inspect request body if scanner is configured and request inspection is enabled.
+    let mut inspection_info: Option<bulwark_audit::event::InspectionInfo> = None;
+    let body_bytes = if let Some(scanner) = ctx
+        .content_scanner
+        .as_ref()
+        .filter(|s| s.inspect_requests())
+    {
         let result = scanner.scan_bytes(&body_bytes);
         if result.should_block {
             tracing::warn!(
@@ -330,7 +335,36 @@ async fn forward_tls_request(
                 "Request blocked by content inspection",
             ));
         }
-    }
+        if result.should_redact {
+            let body_str = std::str::from_utf8(&body_bytes).unwrap_or_default();
+            let redacted = bulwark_inspect::redact_text(body_str, &result.findings);
+            tracing::info!(
+                finding_count = result.findings.len(),
+                "redacted request body before forwarding"
+            );
+            inspection_info = Some(bulwark_audit::event::InspectionInfo {
+                finding_count: result.findings.len() as u64,
+                action_taken: "redacted".to_string(),
+                max_severity: result
+                    .max_severity
+                    .map(|s| format!("{:?}", s).to_lowercase()),
+            });
+            Bytes::from(redacted.into_bytes())
+        } else if !result.findings.is_empty() {
+            inspection_info = Some(bulwark_audit::event::InspectionInfo {
+                finding_count: result.findings.len() as u64,
+                action_taken: "logged".to_string(),
+                max_severity: result
+                    .max_severity
+                    .map(|s| format!("{:?}", s).to_lowercase()),
+            });
+            body_bytes
+        } else {
+            body_bytes
+        }
+    } else {
+        body_bytes
+    };
 
     // Connect to the real server.
     let tcp = match tokio::net::TcpStream::connect((target_host, target_port)).await {
@@ -425,6 +459,7 @@ async fn forward_tls_request(
             if !is_hop_by_hop(name.as_str())
                 && !is_bulwark_internal(name.as_str())
                 && !strip_set.contains(&name.as_str().to_lowercase())
+                && name.as_str() != "content-length"
             {
                 headers.insert(name.clone(), value.clone());
             }
@@ -492,11 +527,70 @@ async fn forward_tls_request(
     match sender.send_request(outbound).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            let (resp_parts, resp_body) = resp.into_parts();
+            let (mut resp_parts, resp_body) = resp.into_parts();
             let resp_bytes = match resp_body.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => Bytes::new(),
             };
+
+            // Inspect response body if scanner is configured and response inspection is enabled.
+            let resp_bytes = if let Some(scanner) = ctx
+                .content_scanner
+                .as_ref()
+                .filter(|s| s.inspect_responses())
+            {
+                if resp_bytes.len() <= scanner.max_content_size() {
+                    let inspection = scanner.scan_bytes(&resp_bytes);
+                    if inspection.should_block {
+                        tracing::warn!(
+                            host = %host,
+                            findings = inspection.findings.len(),
+                            "blocking upstream HTTPS response due to dangerous content"
+                        );
+                        return Ok(error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Response blocked: upstream returned dangerous content",
+                        ));
+                    }
+                    if inspection.should_redact {
+                        let body_str = std::str::from_utf8(&resp_bytes).unwrap_or_default();
+                        let redacted = bulwark_inspect::redact_text(body_str, &inspection.findings);
+                        tracing::info!(
+                            finding_count = inspection.findings.len(),
+                            "redacted upstream HTTPS response before returning to agent"
+                        );
+                        inspection_info = Some(bulwark_audit::event::InspectionInfo {
+                            finding_count: inspection.findings.len() as u64,
+                            action_taken: "redacted".to_string(),
+                            max_severity: inspection
+                                .max_severity
+                                .map(|s| format!("{:?}", s).to_lowercase()),
+                        });
+                        let redacted_bytes = Bytes::from(redacted.into_bytes());
+                        resp_parts.headers.insert(
+                            hyper::header::CONTENT_LENGTH,
+                            hyper::header::HeaderValue::from(redacted_bytes.len()),
+                        );
+                        redacted_bytes
+                    } else if !inspection.findings.is_empty() {
+                        inspection_info = Some(bulwark_audit::event::InspectionInfo {
+                            finding_count: inspection.findings.len() as u64,
+                            action_taken: "logged".to_string(),
+                            max_severity: inspection
+                                .max_severity
+                                .map(|s| format!("{:?}", s).to_lowercase()),
+                        });
+                        resp_bytes
+                    } else {
+                        resp_bytes
+                    }
+                } else {
+                    resp_bytes
+                }
+            } else {
+                resp_bytes
+            };
+
             let response_bytes = resp_bytes.len() as u64;
 
             log_request(RequestLog {
@@ -527,6 +621,9 @@ async fn forward_tls_request(
                         .duration_us(start.elapsed().as_micros() as u64);
                 if let Some(ref si) = audit_session {
                     builder = builder.session(si.clone());
+                }
+                if let Some(ref ii) = inspection_info {
+                    builder = builder.inspection(ii.clone());
                 }
                 logger.log(builder.build());
             }

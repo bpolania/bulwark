@@ -15,6 +15,10 @@ pub struct ContentScanner {
     min_severity: Option<Severity>,
     /// Maximum content size to inspect (bytes). Larger content is skipped.
     max_content_size: usize,
+    /// Whether to inspect request bodies.
+    inspect_requests: bool,
+    /// Whether to inspect response bodies.
+    inspect_responses: bool,
 }
 
 impl ContentScanner {
@@ -24,6 +28,8 @@ impl ContentScanner {
             rule_set: InspectionRuleSet::builtin(),
             min_severity: None,
             max_content_size: 1_048_576,
+            inspect_requests: true,
+            inspect_responses: true,
         }
     }
 
@@ -38,12 +44,29 @@ impl ContentScanner {
             rule_set,
             min_severity: config.min_severity,
             max_content_size: config.max_content_size,
+            inspect_requests: config.inspect_requests,
+            inspect_responses: config.inspect_responses,
         })
     }
 
     /// Get the underlying rule set.
     pub fn rule_set(&self) -> &InspectionRuleSet {
         &self.rule_set
+    }
+
+    /// Get the maximum content size (bytes) that this scanner will inspect.
+    pub fn max_content_size(&self) -> usize {
+        self.max_content_size
+    }
+
+    /// Whether request inspection is enabled.
+    pub fn inspect_requests(&self) -> bool {
+        self.inspect_requests
+    }
+
+    /// Whether response inspection is enabled.
+    pub fn inspect_responses(&self) -> bool {
+        self.inspect_responses
     }
 
     /// Scan a text string for sensitive content.

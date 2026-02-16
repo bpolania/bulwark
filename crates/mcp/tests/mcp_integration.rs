@@ -786,10 +786,9 @@ for line in sys.stdin:
 "#;
 
 #[tokio::test]
-async fn mcp_tool_response_inspection_in_governance_metadata() {
-    // When the upstream tool result contains a secret, the content scanner
-    // should detect it and include inspection_results in the governance
-    // metadata — without exposing the actual snippet.
+async fn mcp_response_blocked_when_critical_finding() {
+    // When the upstream tool result contains an AWS key (block action),
+    // the response should be blocked with -32003 error.
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -830,7 +829,7 @@ rules:
         .with_policy_engine(engine)
         .with_content_scanner(scanner);
 
-    // Call the tool that returns a secret.
+    // Call the tool that returns an AWS key.
     let req = JsonRpcMessage::Request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: RequestId::Number(1),
@@ -843,36 +842,244 @@ rules:
 
     let resp = gateway.handle_message(req).await.unwrap();
     if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("response should be blocked");
+        assert_eq!(
+            err.code, CONTENT_BLOCKED,
+            "expected CONTENT_BLOCKED (-32003), got: {}",
+            err.code,
+        );
+        assert!(
+            err.message.contains("dangerous content"),
+            "error should mention dangerous content, got: {}",
+            err.message,
+        );
+    } else {
+        panic!("Expected response");
+    }
+
+    gateway.shutdown().await;
+}
+
+/// Mock MCP server that returns a bearer token in its response (redact action, not block).
+const MOCK_MCP_SERVER_WITH_BEARER: &str = r#"
+import sys, json
+def respond(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue
+    method = msg.get("method", "")
+    if method == "initialize":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "1.0"}}})
+    elif method == "tools/list":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "get_token", "description": "Returns a token", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNjk5OTk5OTk5fQ.signature_padding_to_be_long_enough"}]}})
+    else:
+        respond({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}})
+"#;
+
+/// Mock MCP server that echoes back the received arguments as tool result.
+const MOCK_MCP_SERVER_ECHO_ARGS: &str = r#"
+import sys, json
+def respond(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue
+    method = msg.get("method", "")
+    if method == "initialize":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "1.0"}}})
+    elif method == "tools/list":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "echo", "description": "Echoes args", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        args = msg.get("params", {}).get("arguments", {})
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": json.dumps(args)}]}})
+    else:
+        respond({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}})
+"#;
+
+#[tokio::test]
+async fn mcp_response_redacted_when_should_redact() {
+    // When the upstream tool result contains a bearer token (redact action),
+    // the response content should be redacted, not blocked.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found, skipping test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("mock_bearer_server.py");
+    std::fs::write(&script_path, MOCK_MCP_SERVER_WITH_BEARER).unwrap();
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let config = bulwark_config::McpGatewayConfig {
+        upstream_servers: vec![bulwark_config::UpstreamServerConfig {
+            name: "bearer".into(),
+            command: "python3".into(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: Default::default(),
+        }],
+    };
+
+    let gateway = McpGateway::new(config)
+        .await
+        .unwrap()
+        .with_policy_engine(engine)
+        .with_content_scanner(scanner);
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "bearer__get_token",
+            "arguments": {}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "tool call should succeed (redact, not block), got: {:?}",
+            r.error
+        );
+        let result = r.result.unwrap();
+        let result_str = serde_json::to_string(&result).unwrap();
+
+        // The response should contain [REDACTED].
+        assert!(
+            result_str.contains("[REDACTED]"),
+            "response should contain [REDACTED], got: {result_str}",
+        );
+        // The original bearer token should NOT be present.
+        assert!(
+            !result_str.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "response should NOT contain the original bearer token, got: {result_str}",
+        );
+
+        // Governance metadata should indicate redaction.
+        let meta = &result["_meta"]["governance"];
+        let inspection = &meta["inspection_results"];
+        assert!(
+            inspection["redacted"].as_bool().unwrap_or(false),
+            "inspection_results.redacted should be true, got: {inspection}",
+        );
+    } else {
+        panic!("Expected response");
+    }
+
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_request_args_redacted() {
+    // When tool call arguments contain a bearer token, the args should be
+    // redacted before forwarding to the upstream server.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found, skipping test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("mock_echo_server.py");
+    std::fs::write(&script_path, MOCK_MCP_SERVER_ECHO_ARGS).unwrap();
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let config = bulwark_config::McpGatewayConfig {
+        upstream_servers: vec![bulwark_config::UpstreamServerConfig {
+            name: "echo".into(),
+            command: "python3".into(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: Default::default(),
+        }],
+    };
+
+    let gateway = McpGateway::new(config)
+        .await
+        .unwrap()
+        .with_policy_engine(engine)
+        .with_content_scanner(scanner);
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "echo__echo",
+            "arguments": {
+                "token": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNjk5OTk5OTk5fQ.signature_padding_to_be_long_enough"
+            }
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
         assert!(
             r.error.is_none(),
             "tool call should succeed, got: {:?}",
             r.error
         );
         let result = r.result.unwrap();
+        let result_str = serde_json::to_string(&result).unwrap();
 
-        // Verify governance metadata includes inspection_results.
-        let meta = &result["_meta"]["governance"];
-        assert!(!meta.is_null(), "governance metadata should be present");
-
-        let inspection = &meta["inspection_results"];
+        // The echoed arguments should contain [REDACTED] instead of the bearer token.
         assert!(
-            !inspection.is_null(),
-            "inspection_results should be present"
+            result_str.contains("[REDACTED]"),
+            "echoed args should contain [REDACTED], got: {result_str}",
         );
         assert!(
-            inspection["finding_count"].as_u64().unwrap() > 0,
-            "should have at least one finding, got: {inspection}",
-        );
-        assert!(
-            inspection["blocked"].as_bool().unwrap(),
-            "should flag as blocked (AWS key triggers block action)",
-        );
-
-        // Verify no snippets are leaked in governance metadata.
-        let meta_str = serde_json::to_string(&meta).unwrap();
-        assert!(
-            !meta_str.contains("AKIAIOSFODNN7"),
-            "governance metadata must NOT contain the actual secret",
+            !result_str.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "echoed args should NOT contain the original bearer token, got: {result_str}",
         );
     } else {
         panic!("Expected response");
