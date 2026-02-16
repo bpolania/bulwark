@@ -28,6 +28,10 @@ pub struct AuditEvent {
     pub error: Option<ErrorInfo>,
     /// Wall-clock duration of the operation in microseconds.
     pub duration_us: Option<u64>,
+    /// Blake3 hash of this event (computed at insert time for tamper detection).
+    pub event_hash: Option<String>,
+    /// Hash of the previous event in the chain (`"genesis"` for the first event).
+    pub prev_hash: Option<String>,
 }
 
 /// The type of event.
@@ -165,6 +169,8 @@ impl AuditEvent {
                 credential: None,
                 error: None,
                 duration_us: None,
+                event_hash: None,
+                prev_hash: None,
             },
         }
     }

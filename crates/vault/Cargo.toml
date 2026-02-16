@@ -23,6 +23,7 @@ uuid.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

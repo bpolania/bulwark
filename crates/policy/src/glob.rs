@@ -245,3 +245,42 @@ mod tests {
         assert_eq!(pat.source(), "my_pattern*");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn glob_compile_never_panics(pattern in "[a-z*?]{0,30}") {
+            // Should either succeed or return an error, never panic.
+            let _ = GlobPattern::compile(&pattern);
+        }
+
+        #[test]
+        fn literal_glob_matches_itself(s in "[a-z]{1,20}") {
+            // A pattern with no wildcards should match exactly itself.
+            let glob = GlobPattern::compile(&s).unwrap();
+            prop_assert!(glob.matches(&s));
+        }
+
+        #[test]
+        fn star_matches_everything(s in "[a-z]{0,50}") {
+            let glob = GlobPattern::compile("*").unwrap();
+            prop_assert!(glob.matches(&s));
+        }
+
+        #[test]
+        fn glob_is_deterministic(
+            pattern in "[a-z*?]{1,15}",
+            input in "[a-z]{0,30}",
+        ) {
+            if let Ok(glob) = GlobPattern::compile(&pattern) {
+                let r1 = glob.matches(&input);
+                let r2 = glob.matches(&input);
+                prop_assert_eq!(r1, r2);
+            }
+        }
+    }
+}

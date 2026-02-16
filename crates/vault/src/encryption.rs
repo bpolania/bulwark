@@ -110,6 +110,14 @@ impl VaultKey {
         Ok(encrypted)
     }
 
+    /// Derive a 32-byte key for a specific purpose using blake3 key derivation.
+    ///
+    /// The vault identity secret is used as input key material.
+    pub fn derive_key(&self, context: &str) -> [u8; 32] {
+        let secret_str = self.identity.to_string();
+        blake3::derive_key(context, secret_str.expose_secret().as_bytes())
+    }
+
     /// Decrypt age-encrypted ciphertext. Returns the plaintext bytes.
     pub fn decrypt(&self, ciphertext: &[u8]) -> bulwark_common::Result<Vec<u8>> {
         let decryptor = age::Decryptor::new(ciphertext).map_err(|e| {

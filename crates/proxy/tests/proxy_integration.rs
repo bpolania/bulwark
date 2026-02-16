@@ -964,6 +964,151 @@ async fn http_request_blocked_by_content_inspection() {
 }
 
 #[tokio::test]
+async fn proxy_strips_bulwark_session_header() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_header_echo_server().await;
+
+    // Use allow-all policy, no vault, no injection — just a bare proxy.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let (proxy_addr, token) = start_test_proxy_with_policy(ca_dir.to_str().unwrap(), engine).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header(
+            "X-Bulwark-Session",
+            "bwk_sess_test123456789abcdef0123456789abcdef",
+        )
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["headers"]["x-bulwark-session"].is_null(),
+        "x-bulwark-session must be stripped from forwarded request, got: {:?}",
+        body["headers"]
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_strips_proxy_authorization_header() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_header_echo_server().await;
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let (proxy_addr, token) = start_test_proxy_with_policy(ca_dir.to_str().unwrap(), engine).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["headers"]["proxy-authorization"].is_null(),
+        "proxy-authorization must be stripped, got: {:?}",
+        body["headers"]
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn proxy_preserves_regular_headers() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_header_echo_server().await;
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let (proxy_addr, token) = start_test_proxy_with_policy(ca_dir.to_str().unwrap(), engine).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("X-Custom-Header", "keep-me")
+        .header("Authorization", "Bearer agent-token")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body["headers"]["x-custom-header"].as_str(),
+        Some("keep-me"),
+        "custom headers must be preserved"
+    );
+    assert_eq!(
+        body["headers"]["authorization"].as_str(),
+        Some("Bearer agent-token"),
+        "Authorization header must be preserved (not stripped)"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
 async fn https_connect_tunnel() {
     // This test verifies the CONNECT tunnel works with the local CA.
     init_tracing();

@@ -2,7 +2,6 @@
 //! sends an absolute URI (e.g. `GET http://example.com/path`).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -17,11 +16,8 @@ use uuid::Uuid;
 use bulwark_audit::event::{
     AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
 };
-use bulwark_audit::logger::AuditLogger;
-use bulwark_inspect::scanner::ContentScanner;
-use bulwark_policy::engine::PolicyEngine;
-use bulwark_vault::store::Vault;
 
+use crate::context::ProxyRequestContext;
 use crate::logging::RequestLog;
 
 /// Boxed body type used for proxy responses.
@@ -31,10 +27,7 @@ pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 pub async fn forward_request(
     req: Request<Incoming>,
     _client_addr: SocketAddr,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
-    audit_logger: Option<AuditLogger>,
-    content_scanner: Option<Arc<ContentScanner>>,
+    ctx: ProxyRequestContext,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -45,7 +38,7 @@ pub async fn forward_request(
     let url = uri.to_string();
 
     // Validate session from X-Bulwark-Session header if vault is configured.
-    let session = if let Some(ref vault) = vault {
+    let session = if let Some(ref vault) = ctx.vault {
         let vault_guard = vault.lock();
         let token = req
             .headers()
@@ -85,7 +78,7 @@ pub async fn forward_request(
     };
 
     // Evaluate policy if engine is configured.
-    if let Some(engine) = &policy_engine {
+    if let Some(engine) = &ctx.policy_engine {
         use bulwark_policy::context::RequestContext;
         use bulwark_policy::verdict::Verdict;
 
@@ -94,23 +87,23 @@ pub async fn forward_request(
             .map(|pq| pq.to_string())
             .unwrap_or_else(|| "/".to_string());
         let action = format!("{} {}", method, path);
-        let mut ctx = RequestContext::new(&host, action);
+        let mut pctx = RequestContext::new(&host, action);
         if let Some(ref s) = session {
-            ctx = ctx.with_operator(&s.operator);
+            pctx = pctx.with_operator(&s.operator);
             if let Some(ref team) = s.team {
-                ctx = ctx.with_team(team);
+                pctx = pctx.with_team(team);
             }
             if let Some(ref project) = s.project {
-                ctx = ctx.with_project(project);
+                pctx = pctx.with_project(project);
             }
             if let Some(ref env) = s.environment {
-                ctx = ctx.with_environment(env);
+                pctx = pctx.with_environment(env);
             }
             if let Some(ref agent) = s.agent_type {
-                ctx = ctx.with_agent_type(agent);
+                pctx = pctx.with_agent_type(agent);
             }
         }
-        let eval = engine.evaluate(&ctx);
+        let eval = engine.evaluate(&pctx);
 
         match eval.verdict {
             Verdict::Allow | Verdict::Transform => {}
@@ -131,7 +124,7 @@ pub async fn forward_request(
     }
 
     // Resolve credential injection if vault + session are available.
-    let injection = if let (Some(vault), Some(session)) = (&vault, &session) {
+    let injection = if let (Some(vault), Some(session)) = (&ctx.vault, &session) {
         let vault_guard = vault.lock();
         match vault_guard.resolve_credential(&host, session) {
             Ok(Some(cred)) => Some(bulwark_vault::injection::http_injection(&cred)),
@@ -159,7 +152,7 @@ pub async fn forward_request(
     let request_bytes = body_bytes.len() as u64;
 
     // Inspect request body if scanner is configured.
-    if let Some(ref scanner) = content_scanner {
+    if let Some(ref scanner) = ctx.content_scanner {
         let result = scanner.scan_bytes(&body_bytes);
         if result.should_block {
             tracing::warn!(
@@ -174,17 +167,20 @@ pub async fn forward_request(
         }
     }
 
-    // Build the outbound request, stripping hop-by-hop headers.
+    // Build the outbound request, stripping hop-by-hop and Bulwark-internal headers.
     let mut builder = Request::builder().method(parts.method).uri(&uri);
     if let Some(headers) = builder.headers_mut() {
-        // Determine which headers to strip (hop-by-hop + injection strips).
+        // Determine which headers to strip (injection strips).
         let strip_set: std::collections::HashSet<String> = injection
             .as_ref()
             .map(|inj| inj.strip_headers.iter().cloned().collect())
             .unwrap_or_default();
 
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop(name.as_str()) && !strip_set.contains(&name.as_str().to_lowercase()) {
+            if !is_hop_by_hop(name.as_str())
+                && !is_bulwark_internal(name.as_str())
+                && !strip_set.contains(&name.as_str().to_lowercase())
+            {
                 headers.insert(name.clone(), value.clone());
             }
         }
@@ -263,7 +259,7 @@ pub async fn forward_request(
             .emit();
 
             // Emit audit event.
-            if let Some(ref logger) = audit_logger {
+            if let Some(ref logger) = ctx.audit_logger {
                 let mut builder =
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpProxy)
                         .outcome(EventOutcome::Success)
@@ -302,7 +298,7 @@ pub async fn forward_request(
             .emit();
 
             // Emit audit event for failed request.
-            if let Some(ref logger) = audit_logger {
+            if let Some(ref logger) = ctx.audit_logger {
                 let mut builder =
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpProxy)
                         .outcome(EventOutcome::Failed)
@@ -358,5 +354,19 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
+    )
+}
+
+/// Returns `true` for Bulwark-internal headers that must be stripped before
+/// forwarding to upstream servers. These headers are used for governance
+/// between the agent and Bulwark and must never leak to the upstream.
+fn is_bulwark_internal(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "x-bulwark-session"
+            | "x-bulwark-operator"
+            | "x-bulwark-team"
+            | "x-bulwark-project"
+            | "x-bulwark-environment"
     )
 }

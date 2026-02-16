@@ -19,7 +19,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -28,11 +28,8 @@ use uuid::Uuid;
 use bulwark_audit::event::{
     AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
 };
-use bulwark_audit::logger::AuditLogger;
-use bulwark_inspect::scanner::ContentScanner;
-use bulwark_policy::engine::PolicyEngine;
-use bulwark_vault::store::Vault;
 
+use crate::context::ProxyRequestContext;
 use crate::forward::{BoxBody, error_response};
 use crate::logging::RequestLog;
 use crate::tls::TlsState;
@@ -43,10 +40,7 @@ pub async fn handle_connect(
     req: Request<Incoming>,
     _client_addr: SocketAddr,
     tls_state: Arc<TlsState>,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
-    audit_logger: Option<AuditLogger>,
-    content_scanner: Option<Arc<ContentScanner>>,
+    ctx: ProxyRequestContext,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // Extract the target host:port from the CONNECT URI.
     let target_authority = match req.uri().authority() {
@@ -63,12 +57,12 @@ pub async fn handle_connect(
     let target_port = req.uri().port_u16().unwrap_or(443);
 
     // Evaluate policy on the CONNECT target if engine is configured.
-    if let Some(engine) = &policy_engine {
+    if let Some(engine) = &ctx.policy_engine {
         use bulwark_policy::context::RequestContext;
         use bulwark_policy::verdict::Verdict;
 
-        let ctx = RequestContext::new(&target_host, format!("CONNECT {}", target_authority));
-        let eval = engine.evaluate(&ctx);
+        let pctx = RequestContext::new(&target_host, format!("CONNECT {}", target_authority));
+        let eval = engine.evaluate(&pctx);
 
         match eval.verdict {
             Verdict::Allow | Verdict::Transform => {}
@@ -91,10 +85,6 @@ pub async fn handle_connect(
     let tls_state_clone = Arc::clone(&tls_state);
     let target_host_clone = target_host.clone();
     let target_authority_clone = target_authority.clone();
-    let policy_engine_clone = policy_engine;
-    let vault_clone = vault;
-    let audit_clone = audit_logger;
-    let scanner_clone = content_scanner;
 
     tokio::spawn(async move {
         // Wait for the HTTP upgrade to complete.
@@ -112,10 +102,7 @@ pub async fn handle_connect(
             target_port,
             &target_authority_clone,
             tls_state_clone,
-            policy_engine_clone,
-            vault_clone,
-            audit_clone,
-            scanner_clone,
+            ctx,
         )
         .await
         {
@@ -136,17 +123,13 @@ pub async fn handle_connect(
 
 /// Perform the TLS MITM: accept TLS from the client, connect TLS to the
 /// server, and proxy decrypted HTTP between them.
-#[allow(clippy::too_many_arguments)]
 async fn mitm_tunnel(
     upgraded: hyper::upgrade::Upgraded,
     target_host: &str,
     target_port: u16,
     _target_authority: &str,
     tls_state: Arc<TlsState>,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
-    audit_logger: Option<AuditLogger>,
-    content_scanner: Option<Arc<ContentScanner>>,
+    ctx: ProxyRequestContext,
 ) -> bulwark_common::Result<()> {
     // --- Client-side TLS (we are the "server" to the client) ---
     let server_config = ServerConfig::builder()
@@ -187,13 +170,8 @@ async fn mitm_tunnel(
         let host = target_host_owned.clone();
         let port = target_port_owned;
         let connector = tls_state.server_connector.clone();
-        let policy = policy_engine.clone();
-        let vault = vault.clone();
-        let audit = audit_logger.clone();
-        let scanner = content_scanner.clone();
-        async move {
-            forward_tls_request(req, &host, port, connector, policy, vault, audit, scanner).await
-        }
+        let ctx = ctx.clone();
+        async move { forward_tls_request(req, &host, port, connector, ctx).await }
     });
 
     let conn = http1::Builder::new()
@@ -209,16 +187,12 @@ async fn mitm_tunnel(
 
 /// Forward a single decrypted HTTP request to the real server over a fresh
 /// TLS connection.
-#[allow(clippy::too_many_arguments)]
 async fn forward_tls_request(
     req: Request<Incoming>,
     target_host: &str,
     target_port: u16,
     connector: TlsConnector,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
-    audit_logger: Option<AuditLogger>,
-    content_scanner: Option<Arc<ContentScanner>>,
+    ctx: ProxyRequestContext,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -233,7 +207,7 @@ async fn forward_tls_request(
     let host = target_host.to_string();
 
     // Validate session from X-Bulwark-Session header if vault is configured.
-    let session = if let Some(ref vault) = vault {
+    let session = if let Some(ref vault) = ctx.vault {
         let vault_guard = vault.lock();
         let token = req
             .headers()
@@ -273,28 +247,28 @@ async fn forward_tls_request(
     };
 
     // Evaluate policy if engine is configured.
-    if let Some(engine) = &policy_engine {
+    if let Some(engine) = &ctx.policy_engine {
         use bulwark_policy::context::RequestContext;
         use bulwark_policy::verdict::Verdict;
 
         let action = format!("{} {}", method, path);
-        let mut ctx = RequestContext::new(target_host, action);
+        let mut pctx = RequestContext::new(target_host, action);
         if let Some(ref s) = session {
-            ctx = ctx.with_operator(&s.operator);
+            pctx = pctx.with_operator(&s.operator);
             if let Some(ref team) = s.team {
-                ctx = ctx.with_team(team);
+                pctx = pctx.with_team(team);
             }
             if let Some(ref project) = s.project {
-                ctx = ctx.with_project(project);
+                pctx = pctx.with_project(project);
             }
             if let Some(ref env) = s.environment {
-                ctx = ctx.with_environment(env);
+                pctx = pctx.with_environment(env);
             }
             if let Some(ref agent) = s.agent_type {
-                ctx = ctx.with_agent_type(agent);
+                pctx = pctx.with_agent_type(agent);
             }
         }
-        let eval = engine.evaluate(&ctx);
+        let eval = engine.evaluate(&pctx);
 
         match eval.verdict {
             Verdict::Allow | Verdict::Transform => {}
@@ -315,7 +289,7 @@ async fn forward_tls_request(
     }
 
     // Resolve credential injection if vault + session are available.
-    let injection = if let (Some(vault), Some(session)) = (&vault, &session) {
+    let injection = if let (Some(vault), Some(session)) = (&ctx.vault, &session) {
         let vault_guard = vault.lock();
         match vault_guard.resolve_credential(target_host, session) {
             Ok(Some(cred)) => Some(bulwark_vault::injection::http_injection(&cred)),
@@ -343,7 +317,7 @@ async fn forward_tls_request(
     let request_bytes = body_bytes.len() as u64;
 
     // Inspect request body if scanner is configured.
-    if let Some(ref scanner) = content_scanner {
+    if let Some(ref scanner) = ctx.content_scanner {
         let result = scanner.scan_bytes(&body_bytes);
         if result.should_block {
             tracing::warn!(
@@ -362,18 +336,19 @@ async fn forward_tls_request(
     let tcp = match tokio::net::TcpStream::connect((target_host, target_port)).await {
         Ok(t) => t,
         Err(e) => {
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
-                502,
-                start,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
+                status: 502,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
-                0,
-                true,
-                Some(e.to_string()),
-            );
+                response_bytes: 0,
+                tls: true,
+                error: Some(e.to_string()),
+            });
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("connect failed: {e}"),
@@ -384,18 +359,19 @@ async fn forward_tls_request(
     let server_name = match rustls::pki_types::ServerName::try_from(target_host.to_string()) {
         Ok(sn) => sn,
         Err(e) => {
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
-                502,
-                start,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
+                status: 502,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
-                0,
-                true,
-                Some(e.to_string()),
-            );
+                response_bytes: 0,
+                tls: true,
+                error: Some(e.to_string()),
+            });
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("invalid server name: {e}"),
@@ -406,18 +382,19 @@ async fn forward_tls_request(
     let tls_stream = match connector.connect(server_name, tcp).await {
         Ok(s) => s,
         Err(e) => {
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
-                502,
-                start,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
+                status: 502,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
-                0,
-                true,
-                Some(e.to_string()),
-            );
+                response_bytes: 0,
+                tls: true,
+                error: Some(e.to_string()),
+            });
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("TLS connect failed: {e}"),
@@ -438,14 +415,17 @@ async fn forward_tls_request(
     // Build the outbound request.
     let mut builder = Request::builder().method(parts.method).uri(&path);
     if let Some(headers) = builder.headers_mut() {
-        // Determine which headers to strip (hop-by-hop + injection strips).
+        // Determine which headers to strip (injection strips).
         let strip_set: std::collections::HashSet<String> = injection
             .as_ref()
             .map(|inj| inj.strip_headers.iter().cloned().collect())
             .unwrap_or_default();
 
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop(name.as_str()) && !strip_set.contains(&name.as_str().to_lowercase()) {
+            if !is_hop_by_hop(name.as_str())
+                && !is_bulwark_internal(name.as_str())
+                && !strip_set.contains(&name.as_str().to_lowercase())
+            {
                 headers.insert(name.clone(), value.clone());
             }
         }
@@ -479,18 +459,19 @@ async fn forward_tls_request(
     ) {
         Ok(r) => r,
         Err(e) => {
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
-                500,
-                start,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
+                status: 500,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
-                0,
-                true,
-                Some(e.to_string()),
-            );
+                response_bytes: 0,
+                tls: true,
+                error: Some(e.to_string()),
+            });
             return Ok(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error",
@@ -518,21 +499,22 @@ async fn forward_tls_request(
             };
             let response_bytes = resp_bytes.len() as u64;
 
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
                 status,
-                start,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
                 response_bytes,
-                true,
-                None,
-            );
+                tls: true,
+                error: None,
+            });
 
             // Emit audit event.
-            if let Some(ref logger) = audit_logger {
+            if let Some(ref logger) = ctx.audit_logger {
                 let mut builder =
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
                         .outcome(EventOutcome::Success)
@@ -555,21 +537,22 @@ async fn forward_tls_request(
             Ok(Response::from_parts(resp_parts, body))
         }
         Err(e) => {
-            log_request(
-                request_id,
-                &method,
-                &url,
-                &host,
-                502,
-                start,
+            log_request(RequestLog {
+                id: request_id,
+                timestamp: Utc::now(),
+                method: method.to_string(),
+                url: url.clone(),
+                host: host.clone(),
+                status: 502,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
                 request_bytes,
-                0,
-                true,
-                Some(e.to_string()),
-            );
+                response_bytes: 0,
+                tls: true,
+                error: Some(e.to_string()),
+            });
 
             // Emit audit event for failed request.
-            if let Some(ref logger) = audit_logger {
+            if let Some(ref logger) = ctx.audit_logger {
                 let mut builder =
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
                         .outcome(EventOutcome::Failed)
@@ -599,33 +582,8 @@ async fn forward_tls_request(
 }
 
 /// Emit a structured log entry for a proxied request.
-#[allow(clippy::too_many_arguments)]
-fn log_request(
-    id: Uuid,
-    method: &Method,
-    url: &str,
-    host: &str,
-    status: u16,
-    start: Instant,
-    request_bytes: u64,
-    response_bytes: u64,
-    tls: bool,
-    error: Option<String>,
-) {
-    RequestLog {
-        id,
-        timestamp: Utc::now(),
-        method: method.to_string(),
-        url: url.to_string(),
-        host: host.to_string(),
-        status,
-        latency_ms: start.elapsed().as_secs_f64() * 1000.0,
-        request_bytes,
-        response_bytes,
-        tls,
-        error,
-    }
-    .emit();
+fn log_request(log: RequestLog) {
+    log.emit();
 }
 
 /// Returns `true` for headers that must not be forwarded by a proxy.
@@ -641,6 +599,19 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
+    )
+}
+
+/// Returns `true` for Bulwark-internal headers that must be stripped before
+/// forwarding to upstream servers.
+fn is_bulwark_internal(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "x-bulwark-session"
+            | "x-bulwark-operator"
+            | "x-bulwark-team"
+            | "x-bulwark-project"
+            | "x-bulwark-environment"
     )
 }
 

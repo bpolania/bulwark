@@ -16,6 +16,7 @@ use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
+use crate::context::ProxyRequestContext;
 use crate::handler;
 use crate::tls::TlsState;
 
@@ -25,10 +26,7 @@ pub struct ProxyServer {
     tls_state: Arc<TlsState>,
     shutdown: CancellationToken,
     start_time: Instant,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    vault: Option<Arc<parking_lot::Mutex<Vault>>>,
-    audit_logger: Option<AuditLogger>,
-    content_scanner: Option<Arc<ContentScanner>>,
+    ctx: ProxyRequestContext,
 }
 
 impl ProxyServer {
@@ -43,34 +41,31 @@ impl ProxyServer {
             tls_state,
             shutdown: CancellationToken::new(),
             start_time: Instant::now(),
-            policy_engine: None,
-            vault: None,
-            audit_logger: None,
-            content_scanner: None,
+            ctx: ProxyRequestContext::new(),
         })
     }
 
     /// Attach a policy engine for request evaluation.
     pub fn with_policy_engine(mut self, engine: Arc<PolicyEngine>) -> Self {
-        self.policy_engine = Some(engine);
+        self.ctx.policy_engine = Some(engine);
         self
     }
 
     /// Attach a vault for session validation and credential injection.
     pub fn with_vault(mut self, vault: Arc<parking_lot::Mutex<Vault>>) -> Self {
-        self.vault = Some(vault);
+        self.ctx.vault = Some(vault);
         self
     }
 
     /// Attach an audit logger for event logging.
     pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
-        self.audit_logger = Some(logger);
+        self.ctx.audit_logger = Some(logger);
         self
     }
 
     /// Attach a content scanner for request/response inspection.
     pub fn with_content_scanner(mut self, scanner: Arc<ContentScanner>) -> Self {
-        self.content_scanner = Some(scanner);
+        self.ctx.content_scanner = Some(scanner);
         self
     }
 
@@ -163,24 +158,13 @@ impl ProxyServer {
     fn spawn_connection(&self, stream: tokio::net::TcpStream, addr: SocketAddr) {
         let tls_state = Arc::clone(&self.tls_state);
         let start_time = self.start_time;
-        let policy_engine = self.policy_engine.clone();
-        let vault = self.vault.clone();
-        let audit_logger = self.audit_logger.clone();
-        let content_scanner = self.content_scanner.clone();
+        let ctx = self.ctx.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let tls = Arc::clone(&tls_state);
-                let policy = policy_engine.clone();
-                let vault = vault.clone();
-                let audit = audit_logger.clone();
-                let scanner = content_scanner.clone();
-                async move {
-                    handler::handle_request(
-                        req, addr, tls, start_time, policy, vault, audit, scanner,
-                    )
-                    .await
-                }
+                let ctx = ctx.clone();
+                async move { handler::handle_request(req, addr, tls, start_time, ctx).await }
             });
 
             let builder = Builder::new(TokioExecutor::new());

@@ -41,7 +41,8 @@ impl Vault {
 
         let entries = load_credential_entries(&credentials_dir)?;
         let bindings = load_bindings(&bindings_path)?;
-        let session_store = SessionStore::open(&sessions_db_path)?;
+        let pepper = vault_key.derive_key("bulwark session token pepper v1");
+        let session_store = SessionStore::open(&sessions_db_path, pepper)?;
 
         Ok(Self {
             vault_key,

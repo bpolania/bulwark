@@ -66,7 +66,9 @@ impl AuditStore {
                 binding_tool_pattern TEXT,
                 error_category TEXT,
                 error_message TEXT,
-                duration_us INTEGER
+                duration_us INTEGER,
+                event_hash TEXT,
+                prev_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_events(event_type);
@@ -232,6 +234,18 @@ impl AuditStore {
             .unwrap()
             .to_string();
 
+        // Hash chain: get the previous event's hash (or "genesis" for the first event).
+        let prev_hash: String = conn
+            .query_row(
+                "SELECT event_hash FROM audit_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "genesis".to_string());
+
+        // Compute this event's hash from prev_hash + event content.
+        let event_hash = compute_event_hash(&prev_hash, event);
+
         conn.execute(
             "INSERT INTO audit_events (
                 id, timestamp, event_type, outcome, channel,
@@ -240,7 +254,8 @@ impl AuditStore {
                 verdict, matched_rule, matched_policy, policy_scope, reason, evaluation_time_us,
                 credential_name, credential_type, binding_tool_pattern,
                 error_category, error_message,
-                duration_us
+                duration_us,
+                event_hash, prev_hash
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -248,7 +263,8 @@ impl AuditStore {
                 ?16, ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24,
                 ?25, ?26,
-                ?27
+                ?27,
+                ?28, ?29
             )",
             rusqlite::params![
                 event.id,
@@ -284,6 +300,8 @@ impl AuditStore {
                 event.error.as_ref().map(|e| &e.category),
                 event.error.as_ref().map(|e| &e.message),
                 event.duration_us.map(|d| d as i64),
+                event_hash,
+                prev_hash,
             ],
         )
         .map_err(|e| bulwark_common::BulwarkError::Audit(format!("insert error: {e}")))?;
@@ -371,6 +389,8 @@ impl AuditStore {
         });
 
         let duration_us: Option<i64> = row.get("duration_us")?;
+        let event_hash: Option<String> = row.get("event_hash")?;
+        let prev_hash: Option<String> = row.get("prev_hash")?;
 
         Ok(AuditEvent {
             id,
@@ -384,6 +404,8 @@ impl AuditStore {
             credential,
             error,
             duration_us: duration_us.map(|d| d as u64),
+            event_hash,
+            prev_hash,
         })
     }
 
@@ -458,6 +480,137 @@ impl AuditStore {
             .map_err(|e| bulwark_common::BulwarkError::Audit(format!("count since error: {e}")))?;
         Ok(count as u64)
     }
+
+    /// Verify the integrity of the audit hash chain.
+    ///
+    /// Re-computes each event's hash and checks that:
+    /// 1. The first event's `prev_hash` is `"genesis"`.
+    /// 2. Each subsequent event's `prev_hash` equals the previous event's `event_hash`.
+    /// 3. Each event's stored `event_hash` matches the re-computed hash.
+    ///
+    /// Returns a [`ChainVerification`] with the result.
+    pub fn verify_chain(&self) -> bulwark_common::Result<ChainVerification> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT * FROM audit_events ORDER BY rowid ASC")
+            .map_err(|e| {
+                bulwark_common::BulwarkError::Audit(format!("verify prepare error: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| self.row_to_event(row))
+            .map_err(|e| bulwark_common::BulwarkError::Audit(format!("verify query error: {e}")))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|e| {
+                bulwark_common::BulwarkError::Audit(format!("verify row error: {e}"))
+            })?);
+        }
+
+        if events.is_empty() {
+            return Ok(ChainVerification {
+                valid: true,
+                events_checked: 0,
+                first_invalid_index: None,
+                error: None,
+            });
+        }
+
+        let mut expected_prev = "genesis".to_string();
+
+        for (i, event) in events.iter().enumerate() {
+            let stored_hash = match &event.event_hash {
+                Some(h) => h,
+                None => {
+                    return Ok(ChainVerification {
+                        valid: false,
+                        events_checked: i as u64,
+                        first_invalid_index: Some(i as u64),
+                        error: Some(format!("event {} has no event_hash", event.id)),
+                    });
+                }
+            };
+
+            let stored_prev = match &event.prev_hash {
+                Some(h) => h,
+                None => {
+                    return Ok(ChainVerification {
+                        valid: false,
+                        events_checked: i as u64,
+                        first_invalid_index: Some(i as u64),
+                        error: Some(format!("event {} has no prev_hash", event.id)),
+                    });
+                }
+            };
+
+            // Check chain linkage.
+            if *stored_prev != expected_prev {
+                return Ok(ChainVerification {
+                    valid: false,
+                    events_checked: i as u64,
+                    first_invalid_index: Some(i as u64),
+                    error: Some(format!(
+                        "event {} prev_hash mismatch: expected {}, got {}",
+                        event.id, expected_prev, stored_prev
+                    )),
+                });
+            }
+
+            // Re-compute hash and compare.
+            let recomputed = compute_event_hash(&expected_prev, event);
+            if recomputed != *stored_hash {
+                return Ok(ChainVerification {
+                    valid: false,
+                    events_checked: i as u64,
+                    first_invalid_index: Some(i as u64),
+                    error: Some(format!(
+                        "event {} hash mismatch: expected {}, stored {}",
+                        event.id, recomputed, stored_hash
+                    )),
+                });
+            }
+
+            expected_prev = stored_hash.clone();
+        }
+
+        Ok(ChainVerification {
+            valid: true,
+            events_checked: events.len() as u64,
+            first_invalid_index: None,
+            error: None,
+        })
+    }
+}
+
+/// Result of verifying the audit hash chain.
+#[derive(Debug, Clone)]
+pub struct ChainVerification {
+    /// Whether the chain is valid (no tampering detected).
+    pub valid: bool,
+    /// Number of events that were checked.
+    pub events_checked: u64,
+    /// Index of the first invalid event (if any).
+    pub first_invalid_index: Option<u64>,
+    /// Description of the first error found.
+    pub error: Option<String>,
+}
+
+/// Compute the blake3 hash for an audit event.
+///
+/// The hash covers `prev_hash` + all event content (excluding the hash fields
+/// themselves). Uses JSON serialization with hash fields set to `None` for
+/// deterministic, order-preserving content representation.
+pub fn compute_event_hash(prev_hash: &str, event: &AuditEvent) -> String {
+    let mut event_for_hash = event.clone();
+    event_for_hash.event_hash = None;
+    event_for_hash.prev_hash = None;
+    let content = serde_json::to_string(&event_for_hash).unwrap();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(content.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]
@@ -707,6 +860,129 @@ mod tests {
         let stats = store.stats(None).unwrap();
         assert_eq!(stats.total_events, 0);
         assert_eq!(stats.last_hour, 0);
+    }
+
+    // -- Hash chain tests --
+
+    #[test]
+    fn hash_chain_empty_db_is_valid() {
+        let (_dir, store) = temp_store();
+        let result = store.verify_chain().unwrap();
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 0);
+    }
+
+    #[test]
+    fn hash_chain_single_event_is_valid() {
+        let (_dir, store) = temp_store();
+        store
+            .insert(&sample_event(
+                EventType::RequestProcessed,
+                EventOutcome::Success,
+            ))
+            .unwrap();
+        let result = store.verify_chain().unwrap();
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 1);
+    }
+
+    #[test]
+    fn hash_chain_multiple_events_is_valid() {
+        let (_dir, store) = temp_store();
+        for _ in 0..10 {
+            store
+                .insert(&sample_event(
+                    EventType::RequestProcessed,
+                    EventOutcome::Success,
+                ))
+                .unwrap();
+        }
+        let result = store.verify_chain().unwrap();
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 10);
+    }
+
+    #[test]
+    fn hash_chain_detects_tampered_event() {
+        let (_dir, store) = temp_store();
+        store
+            .insert(&sample_event(
+                EventType::RequestProcessed,
+                EventOutcome::Success,
+            ))
+            .unwrap();
+        store
+            .insert(&sample_event(EventType::Error, EventOutcome::Failed))
+            .unwrap();
+
+        // Tamper: change the outcome of the first event directly in the DB.
+        store
+            .db
+            .execute(
+                "UPDATE audit_events SET outcome = 'denied' WHERE rowid = 1",
+                [],
+            )
+            .unwrap();
+
+        let result = store.verify_chain().unwrap();
+        assert!(!result.valid, "tampered chain must be detected");
+        assert_eq!(result.first_invalid_index, Some(0));
+        assert!(result.error.unwrap().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn hash_chain_detects_broken_linkage() {
+        let (_dir, store) = temp_store();
+        store
+            .insert(&sample_event(
+                EventType::RequestProcessed,
+                EventOutcome::Success,
+            ))
+            .unwrap();
+        store
+            .insert(&sample_event(EventType::Error, EventOutcome::Failed))
+            .unwrap();
+
+        // Tamper: change the prev_hash of the second event.
+        store
+            .db
+            .execute(
+                "UPDATE audit_events SET prev_hash = 'tampered' WHERE rowid = 2",
+                [],
+            )
+            .unwrap();
+
+        let result = store.verify_chain().unwrap();
+        assert!(!result.valid, "broken linkage must be detected");
+        assert_eq!(result.first_invalid_index, Some(1));
+        assert!(result.error.unwrap().contains("prev_hash mismatch"));
+    }
+
+    #[test]
+    fn hash_chain_first_event_has_genesis_prev() {
+        let (_dir, store) = temp_store();
+        store
+            .insert(&sample_event(
+                EventType::RequestProcessed,
+                EventOutcome::Success,
+            ))
+            .unwrap();
+
+        let events = store.query(&AuditFilter::default()).unwrap();
+        assert_eq!(events[0].prev_hash.as_deref(), Some("genesis"));
+    }
+
+    #[test]
+    fn hash_chain_batch_insert_maintains_chain() {
+        let (_dir, store) = temp_store();
+        let events: Vec<AuditEvent> = (0..5)
+            .map(|_| sample_event(EventType::RequestProcessed, EventOutcome::Success))
+            .collect();
+        store.insert_batch(&events).unwrap();
+
+        let result = store.verify_chain().unwrap();
+        assert!(result.valid);
+        assert_eq!(result.events_checked, 5);
     }
 
     #[test]

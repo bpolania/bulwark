@@ -366,3 +366,30 @@ mod tests {
         assert_eq!(json, REDACTED_MARKER);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::scanner::ContentScanner;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn redact_text_never_panics(text in "\\PC{0,200}") {
+            let scanner = ContentScanner::builtin();
+            let result = scanner.scan_text(&text);
+            let _ = redact_text(&text, &result.findings);
+        }
+
+        #[test]
+        fn redact_text_output_not_shorter_with_no_findings(text in "[a-zA-Z ]{0,100}") {
+            let scanner = ContentScanner::builtin();
+            let result = scanner.scan_text(&text);
+            // Clean text → no findings → redacted == original.
+            if result.findings.is_empty() {
+                let redacted = redact_text(&text, &result.findings);
+                prop_assert_eq!(redacted, text);
+            }
+        }
+    }
+}

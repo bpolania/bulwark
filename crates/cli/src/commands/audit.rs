@@ -162,6 +162,33 @@ pub fn cleanup(config_path: &Path, days_override: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Verify the integrity of the audit hash chain.
+pub fn verify(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path).context("loading configuration")?;
+    let db_path = bulwark_config::expand_tilde(&config.audit.db_path);
+    let store = AuditStore::open(Path::new(&db_path)).context("opening audit database")?;
+
+    let result = store.verify_chain().context("verifying audit hash chain")?;
+
+    if result.valid {
+        eprintln!(
+            "Audit hash chain is valid ({} events verified)",
+            result.events_checked
+        );
+    } else {
+        eprintln!("Audit hash chain INVALID!");
+        eprintln!("  Events checked: {}", result.events_checked);
+        if let Some(idx) = result.first_invalid_index {
+            eprintln!("  First invalid event index: {idx}");
+        }
+        if let Some(err) = &result.error {
+            eprintln!("  Error: {err}");
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Parse a relative time string like "1h", "24h", "7d" into a DateTime.
 fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = s.trim();

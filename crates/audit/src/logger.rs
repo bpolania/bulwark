@@ -32,6 +32,10 @@ impl AuditLogger {
     /// Opens (or creates) the SQLite database at `db_path` and spawns a
     /// background writer task on the current tokio runtime.
     pub fn new(db_path: &Path) -> bulwark_common::Result<Self> {
+        debug_assert!(
+            db_path.extension().is_some_and(|ext| ext == "db"),
+            "audit db_path should have .db extension"
+        );
         let store = AuditStore::open(db_path)?;
         let (tx, rx) = mpsc::unbounded_channel();
 

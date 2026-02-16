@@ -29,6 +29,10 @@ impl ContentScanner {
 
     /// Create a scanner from configuration.
     pub fn from_config(config: &InspectionConfig) -> bulwark_common::Result<Self> {
+        debug_assert!(
+            config.max_content_size > 0,
+            "max_content_size must be positive"
+        );
         let rule_set = InspectionRuleSet::from_config(config)?;
         Ok(Self {
             rule_set,
@@ -359,5 +363,76 @@ mod tests {
         );
         assert!(result.findings.len() >= 3);
         assert!(result.should_block); // AWS key and SSN should trigger block
+    }
+
+    // -- Precondition test --
+
+    #[test]
+    fn from_config_with_small_max_content_size() {
+        // A very small max_content_size causes oversized content to be skipped.
+        let config = InspectionConfig {
+            max_content_size: 5,
+            ..Default::default()
+        };
+        let scanner = ContentScanner::from_config(&config).unwrap();
+        // Content exceeding max_content_size is skipped → no findings.
+        let result = scanner.scan_text("AKIAIOSFODNN7EXAMPLE is way too long");
+        assert!(result.findings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::finding::FindingLocation;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn scan_text_never_panics(text in "\\PC{0,500}") {
+            let scanner = ContentScanner::builtin();
+            let _ = scanner.scan_text(&text);
+        }
+
+        #[test]
+        fn scan_bytes_never_panics(data in prop::collection::vec(any::<u8>(), 0..500)) {
+            let scanner = ContentScanner::builtin();
+            let _ = scanner.scan_bytes(&data);
+        }
+
+        #[test]
+        fn scan_json_never_panics(s in "[a-zA-Z0-9 _@.]{0,200}") {
+            let scanner = ContentScanner::builtin();
+            let value = serde_json::json!({"input": s});
+            let _ = scanner.scan_json(&value);
+        }
+
+        #[test]
+        fn clean_text_has_no_findings(s in "[a-zA-Z ]{0,100}") {
+            let scanner = ContentScanner::builtin();
+            let result = scanner.scan_text(&s);
+            prop_assert!(
+                result.findings.is_empty(),
+                "False positive on clean text: {:?}",
+                result.findings
+            );
+        }
+
+        #[test]
+        fn findings_have_valid_byte_ranges(text in "\\PC{0,500}") {
+            let scanner = ContentScanner::builtin();
+            let result = scanner.scan_text(&text);
+            for finding in &result.findings {
+                if let FindingLocation::ByteRange { start, end } = &finding.location {
+                    prop_assert!(*start <= *end, "start > end: {} > {}", start, end);
+                    prop_assert!(
+                        *end <= text.len(),
+                        "end > len: {} > {}",
+                        end,
+                        text.len()
+                    );
+                }
+            }
+        }
     }
 }

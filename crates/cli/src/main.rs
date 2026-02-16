@@ -187,6 +187,8 @@ enum AuditAction {
         #[arg(long)]
         days: Option<u32>,
     },
+    /// Verify the integrity of the audit hash chain.
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -311,6 +313,7 @@ fn main() -> Result<()> {
             AuditAction::Stats { since } => commands::audit::stats(&cli.config, since.as_deref()),
             AuditAction::Export { since } => commands::audit::export(&cli.config, since.as_deref()),
             AuditAction::Cleanup { days } => commands::audit::cleanup(&cli.config, days),
+            AuditAction::Verify => commands::audit::verify(&cli.config),
         },
         Commands::Inspect { action } => match action {
             InspectAction::Scan { text, file, format } => {

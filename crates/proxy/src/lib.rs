@@ -5,6 +5,7 @@
 //! as structured JSON.
 #![forbid(unsafe_code)]
 
+pub mod context;
 pub mod forward;
 pub mod handler;
 pub mod logging;

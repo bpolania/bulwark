@@ -122,6 +122,26 @@ impl PolicyEngine {
             )
         });
 
+        debug_assert!(
+            rules.windows(2).all(|w| {
+                compare_precedence(
+                    &RulePrecedence {
+                        scope: w[0].scope,
+                        verdict: w[0].verdict.clone(),
+                        priority: w[0].priority,
+                        load_order: w[0].load_order,
+                    },
+                    &RulePrecedence {
+                        scope: w[1].scope,
+                        verdict: w[1].verdict.clone(),
+                        priority: w[1].priority,
+                        load_order: w[1].load_order,
+                    },
+                ) != std::cmp::Ordering::Greater
+            }),
+            "rules must be sorted by precedence after reload"
+        );
+
         tracing::info!(
             rules = rules.len(),
             sources = source_count,
@@ -141,6 +161,15 @@ impl PolicyEngine {
     /// Returns `Verdict::Deny` with reason "no matching rule (default deny)"
     /// when no rules match.
     pub fn evaluate(&self, ctx: &RequestContext) -> PolicyEvaluation {
+        debug_assert!(
+            !ctx.action.is_empty(),
+            "RequestContext.action must not be empty"
+        );
+        debug_assert!(
+            !ctx.tool.is_empty(),
+            "RequestContext.tool must not be empty"
+        );
+
         let start = Instant::now();
         let state = self.state.load();
 
@@ -918,5 +947,90 @@ rules:
         let engine = PolicyEngine::from_directory(dir.path()).unwrap();
         let eval = engine.evaluate(&RequestContext::new("x", "y"));
         assert_eq!(eval.matched_policy.as_deref(), Some("custom-name"));
+    }
+
+    // -- Precondition tests --
+
+    #[test]
+    fn empty_engine_always_denies() {
+        let engine = PolicyEngine::new();
+        let ctx = RequestContext::new("some-tool", "some-action");
+        let eval = engine.evaluate(&ctx);
+        // Empty engine → default deny.
+        assert_eq!(eval.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn evaluate_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_policy(
+            dir.path(),
+            "test.yaml",
+            r#"
+rules:
+  - name: allow-get
+    verdict: allow
+    match:
+      actions: ["GET *"]
+  - name: deny-all
+    verdict: deny
+"#,
+        );
+        let engine = PolicyEngine::from_directory(dir.path()).unwrap();
+        let ctx = RequestContext::new("host", "GET /path");
+        let v1 = engine.evaluate(&ctx);
+        let v2 = engine.evaluate(&ctx);
+        assert_eq!(format!("{:?}", v1.verdict), format!("{:?}", v2.verdict));
+        assert_eq!(v1.matched_rule, v2.matched_rule);
+    }
+
+    #[test]
+    fn loaded_rules_are_sorted_by_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_policy(
+            dir.path(),
+            "test.yaml",
+            r#"
+rules:
+  - name: low-priority
+    verdict: allow
+    priority: 1
+  - name: high-priority
+    verdict: deny
+    priority: 100
+"#,
+        );
+        let engine = PolicyEngine::from_directory(dir.path()).unwrap();
+        // Verify ordering is consistent: higher-precedence rules should win.
+        let ctx = RequestContext::new("x", "y");
+        let eval = engine.evaluate(&ctx);
+        assert_eq!(eval.verdict, Verdict::Deny);
+        assert_eq!(eval.matched_rule.as_deref(), Some("high-priority"));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_request_context() -> impl Strategy<Value = RequestContext> {
+        ("[a-z_]{1,20}", "[a-z_]{1,20}")
+            .prop_map(|(tool, action)| RequestContext::new(tool, action))
+    }
+
+    proptest! {
+        #[test]
+        fn evaluate_never_panics(ctx in arb_request_context()) {
+            let engine = PolicyEngine::new();
+            let _verdict = engine.evaluate(&ctx);
+        }
+
+        #[test]
+        fn empty_engine_always_denies_prop(ctx in arb_request_context()) {
+            let engine = PolicyEngine::new();
+            let eval = engine.evaluate(&ctx);
+            prop_assert!(matches!(eval.verdict, Verdict::Deny));
+        }
     }
 }
