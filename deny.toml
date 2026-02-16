@@ -6,7 +6,7 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 vulnerability = "deny"
 unmaintained = "workspace"
-yanked = "workspace"
+yanked = "warn"
 notice = "workspace"
 
 [licenses]
