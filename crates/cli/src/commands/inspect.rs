@@ -104,11 +104,32 @@ pub fn scan(
 }
 
 /// List all inspection rules.
-pub fn rules(config_path: &Path, show_all: bool) -> Result<()> {
+pub fn rules(config_path: &Path, show_all: bool, json: bool) -> Result<()> {
     let config = load_config(config_path).context("loading configuration")?;
     let scanner =
         ContentScanner::from_config(&config.inspect).context("creating content scanner")?;
     let rule_set = scanner.rule_set();
+
+    if json {
+        let rules: Vec<serde_json::Value> = rule_set
+            .all_rules()
+            .iter()
+            .filter(|r| show_all || r.enabled)
+            .map(|r| {
+                let m = &r.matcher;
+                serde_json::json!({
+                    "id": m.id,
+                    "severity": format!("{:?}", m.severity).to_lowercase(),
+                    "category": serde_json::to_value(&m.category).ok(),
+                    "action": format!("{:?}", m.action).to_lowercase(),
+                    "description": m.description,
+                    "enabled": r.enabled,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rules)?);
+        return Ok(());
+    }
 
     let enabled = rule_set.enabled_count();
     let total = rule_set.rule_count();

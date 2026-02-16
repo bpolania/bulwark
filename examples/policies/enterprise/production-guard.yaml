@@ -1,0 +1,23 @@
+metadata:
+  name: production-guard
+  description: "Block destructive and write operations in production environments."
+  scope: project
+
+rules:
+  - name: block-destructive-in-production
+    verdict: deny
+    reason: "Destructive operations are blocked in production"
+    priority: 100
+    match:
+      actions: ["delete*", "drop*", "destroy*", "terminate*", "remove*"]
+    conditions:
+      environments: ["production", "prod"]
+
+  - name: block-writes-in-production
+    verdict: deny
+    reason: "Write operations are blocked in production"
+    priority: 90
+    match:
+      actions: ["create*", "update*", "write*", "modify*", "patch*"]
+    conditions:
+      environments: ["production", "prod"]

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 mod commands;
 
@@ -18,6 +18,10 @@ struct Cli {
     /// Override the log level (trace, debug, info, warn, error).
     #[arg(long, global = true)]
     log_level: Option<String>,
+
+    /// Disable colored output.
+    #[arg(long, global = true)]
+    no_color: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -70,6 +74,24 @@ enum Commands {
         #[command(subcommand)]
         action: InspectAction,
     },
+    /// Diagnose common setup issues.
+    Doctor {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show health dashboard of all subsystems.
+    Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +113,21 @@ enum PolicyAction {
         /// Path to the policies directory.
         #[arg(default_value = "./policies")]
         path: PathBuf,
+    },
+    /// Test policies by replaying audit events.
+    Test {
+        /// Directory containing policies to test.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Only replay events since this time (e.g. 1h, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum events to replay.
+        #[arg(long, default_value = "1000")]
+        limit: usize,
+        /// Show events where verdict didn't change.
+        #[arg(long)]
+        show_unchanged: bool,
     },
 }
 
@@ -210,6 +247,9 @@ enum InspectAction {
         /// Show disabled rules too.
         #[arg(long)]
         all: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -244,16 +284,32 @@ enum SessionAction {
         /// Include revoked sessions.
         #[arg(long)]
         all: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Revoke a session.
     Revoke {
         /// Session ID to revoke.
         id: String,
     },
+    /// Show detailed activity timeline for a session.
+    Inspect {
+        /// Session ID to inspect.
+        id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Respect NO_COLOR env var and --no-color flag.
+    if cli.no_color || std::env::var("NO_COLOR").is_ok() {
+        colored::control::set_override(false);
+    }
 
     match cli.command {
         Commands::Proxy { action } => match action {
@@ -270,6 +326,18 @@ fn main() -> Result<()> {
         },
         Commands::Policy { action } => match action {
             PolicyAction::Validate { path } => commands::policy::validate(&path),
+            PolicyAction::Test {
+                dir,
+                since,
+                limit,
+                show_unchanged,
+            } => commands::policy::test_replay(
+                &cli.config,
+                &dir,
+                since.as_deref(),
+                limit,
+                show_unchanged,
+            ),
         },
         Commands::Cred { action } => match action {
             CredAction::Add {
@@ -319,7 +387,7 @@ fn main() -> Result<()> {
             InspectAction::Scan { text, file, format } => {
                 commands::inspect::scan(&cli.config, text.as_deref(), file.as_deref(), &format)
             }
-            InspectAction::Rules { all } => commands::inspect::rules(&cli.config, all),
+            InspectAction::Rules { all, json } => commands::inspect::rules(&cli.config, all, json),
         },
         Commands::Session { action } => match action {
             SessionAction::Create {
@@ -340,8 +408,39 @@ fn main() -> Result<()> {
                 ttl,
                 description.as_deref(),
             ),
-            SessionAction::List { all } => commands::session::list(&cli.config, all),
+            SessionAction::List { all, json } => commands::session::list(&cli.config, all, json),
             SessionAction::Revoke { id } => commands::session::revoke(&cli.config, &id),
+            SessionAction::Inspect { id, json } => {
+                commands::session::inspect(&cli.config, &id, json)
+            }
         },
+        Commands::Doctor { json } => commands::doctor::run(&cli.config, json),
+        Commands::Status { json } => commands::status::run(&cli.config, json),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "bulwark", &mut std::io::stdout());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_flag_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "--no-color", "inspect", "rules"]).unwrap();
+        assert!(cli.no_color);
+    }
+
+    #[test]
+    fn completions_bash_generates_output() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "bulwark", &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.is_empty());
+        assert!(output.contains("bulwark"));
     }
 }

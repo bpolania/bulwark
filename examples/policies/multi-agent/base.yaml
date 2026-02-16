@@ -1,0 +1,18 @@
+metadata:
+  name: multi-agent-base
+  description: "Default deny with read access for all agents."
+  scope: global
+
+rules:
+  - name: default-deny
+    verdict: deny
+    reason: "Multi-agent: deny by default"
+    priority: 0
+    match: {}
+
+  - name: all-agents-can-read
+    verdict: allow
+    reason: "All agents may perform read operations"
+    priority: 10
+    match:
+      actions: ["read*", "get*", "list*"]

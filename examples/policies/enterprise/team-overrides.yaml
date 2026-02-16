@@ -1,0 +1,15 @@
+metadata:
+  name: team-overrides
+  description: "SRE and platform teams retain full production access."
+  scope: team
+
+rules:
+  - name: sre-team-prod-access
+    verdict: allow
+    reason: "SRE team has full production access"
+    priority: 200
+    match:
+      actions: ["*"]
+    conditions:
+      teams: ["sre", "platform-engineering"]
+      environments: ["production", "prod"]

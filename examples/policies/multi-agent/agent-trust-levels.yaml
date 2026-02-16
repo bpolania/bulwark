@@ -1,0 +1,32 @@
+metadata:
+  name: agent-trust-levels
+  description: "Different trust levels for different agent types."
+  scope: agent
+
+rules:
+  - name: trusted-agents-full-access
+    verdict: allow
+    reason: "Trusted agents have full access"
+    priority: 50
+    match:
+      actions: ["*"]
+    conditions:
+      agent_types: ["claude-code"]
+
+  - name: semi-trusted-read-write
+    verdict: allow
+    reason: "Semi-trusted agents can read and write"
+    priority: 40
+    match:
+      actions: ["read*", "get*", "list*", "create*", "update*"]
+    conditions:
+      agent_types: ["openclaw", "cursor"]
+
+  - name: untrusted-read-only
+    verdict: allow
+    reason: "Untrusted agents are read-only"
+    priority: 30
+    match:
+      actions: ["read*", "get*", "list*"]
+    conditions:
+      agent_types: ["codex", "custom-*"]

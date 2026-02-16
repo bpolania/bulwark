@@ -1,0 +1,25 @@
+metadata:
+  name: startup-base
+  description: "Minimal, permissive policies for getting started. Log everything, block nothing."
+  scope: global
+
+rules:
+  - name: allow-all-reads
+    verdict: allow
+    reason: "Reads are always safe"
+    priority: 10
+    match:
+      actions: ["read*", "get*", "list*", "search*", "describe*"]
+
+  - name: allow-all-writes
+    verdict: allow
+    reason: "Writes allowed in startup mode"
+    priority: 10
+    match:
+      actions: ["create*", "update*", "write*", "send*", "post*", "put*"]
+
+  - name: allow-everything-else
+    verdict: allow
+    reason: "Startup mode: allow by default"
+    priority: 1
+    match: {}
