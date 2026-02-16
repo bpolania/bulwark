@@ -54,6 +54,10 @@ pub enum EventType {
     SessionValidationFailed,
     /// An upstream server started or restarted.
     UpstreamLifecycle,
+    /// A request was denied due to rate limiting.
+    RateLimited,
+    /// A request was denied because a cost budget was exceeded.
+    BudgetExceeded,
     /// An error occurred during processing.
     Error,
 }

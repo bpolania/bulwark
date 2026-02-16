@@ -402,6 +402,7 @@ dependencies = [
  "bulwark-config",
  "bulwark-inspect",
  "bulwark-policy",
+ "bulwark-ratelimit",
  "bulwark-vault",
  "bytes",
  "chrono",
@@ -443,6 +444,7 @@ dependencies = [
  "bulwark-config",
  "bulwark-inspect",
  "bulwark-policy",
+ "bulwark-ratelimit",
  "bulwark-vault",
  "bytes",
  "chrono",
@@ -469,6 +471,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "bulwark-ratelimit"
+version = "0.1.0"
+dependencies = [
+ "bulwark-common",
+ "bulwark-config",
+ "bulwark-policy",
+ "parking_lot",
+ "proptest",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

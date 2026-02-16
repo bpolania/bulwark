@@ -14,7 +14,11 @@ use bulwark_audit::logger::AuditLogger;
 use bulwark_config::ProxyConfig;
 use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
+use bulwark_ratelimit::cost::CostTracker;
+use bulwark_ratelimit::limiter::RateLimiter;
 use bulwark_vault::store::Vault;
+
+use crate::toolmap::ToolMapper;
 
 use crate::context::ProxyRequestContext;
 use crate::handler;
@@ -66,6 +70,24 @@ impl ProxyServer {
     /// Attach a content scanner for request/response inspection.
     pub fn with_content_scanner(mut self, scanner: Arc<ContentScanner>) -> Self {
         self.ctx.content_scanner = Some(scanner);
+        self
+    }
+
+    /// Attach a tool mapper for URL-to-tool resolution.
+    pub fn with_tool_mapper(mut self, mapper: Arc<ToolMapper>) -> Self {
+        self.ctx.tool_mapper = Some(mapper);
+        self
+    }
+
+    /// Attach a rate limiter.
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.ctx.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Attach a cost tracker.
+    pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
+        self.ctx.cost_tracker = Some(tracker);
         self
     }
 

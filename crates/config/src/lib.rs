@@ -27,6 +27,10 @@ pub struct BulwarkConfig {
     pub audit: AuditConfig,
     /// Content inspection settings.
     pub inspect: bulwark_inspect::config::InspectionConfig,
+    /// Rate limiting settings.
+    pub rate_limit: RateLimitConfig,
+    /// Cost estimation settings.
+    pub cost_estimation: CostConfig,
 }
 
 /// Configuration for the proxy listener.
@@ -37,6 +41,8 @@ pub struct ProxyConfig {
     pub listen_address: String,
     /// TLS / certificate authority settings.
     pub tls: TlsConfig,
+    /// URL-to-tool mappings for semantic policy evaluation.
+    pub tool_mappings: Vec<ToolMapping>,
 }
 
 impl Default for ProxyConfig {
@@ -44,6 +50,66 @@ impl Default for ProxyConfig {
         Self {
             listen_address: "127.0.0.1:8080".to_string(),
             tls: TlsConfig::default(),
+            tool_mappings: Vec::new(),
+        }
+    }
+}
+
+/// Maps a URL pattern to a semantic tool name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolMapping {
+    /// Glob pattern to match against the URL (host + path).
+    pub url_pattern: String,
+    /// Semantic tool name to use for policy evaluation.
+    pub tool: String,
+    /// How to derive the action from the request.
+    #[serde(default)]
+    pub action_from: ActionFrom,
+}
+
+/// How to derive the policy action from an HTTP request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ActionFrom {
+    /// Use the URL path as the action (default).
+    #[default]
+    UrlPath,
+    /// Use the HTTP method as the action.
+    Method,
+    /// Use a specific path segment (0-indexed) as the action.
+    PathSegment(usize),
+    /// Use a fixed string as the action.
+    Static(String),
+}
+
+impl Serialize for ActionFrom {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ActionFrom::UrlPath => serializer.serialize_str("url_path"),
+            ActionFrom::Method => serializer.serialize_str("method"),
+            ActionFrom::PathSegment(n) => serializer.serialize_str(&format!("path_segment:{n}")),
+            ActionFrom::Static(s) => serializer.serialize_str(&format!("static:{s}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionFrom {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s == "url_path" {
+            Ok(ActionFrom::UrlPath)
+        } else if s == "method" {
+            Ok(ActionFrom::Method)
+        } else if let Some(rest) = s.strip_prefix("path_segment:") {
+            let n: usize = rest.parse().map_err(|e| {
+                serde::de::Error::custom(format!("invalid path_segment index: {e}"))
+            })?;
+            Ok(ActionFrom::PathSegment(n))
+        } else if let Some(rest) = s.strip_prefix("static:") {
+            Ok(ActionFrom::Static(rest.to_string()))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unknown action_from variant: '{s}'. Expected url_path, method, path_segment:N, or static:VALUE"
+            )))
         }
     }
 }
@@ -188,6 +254,83 @@ impl Default for AuditConfig {
     }
 }
 
+/// Rate limiting configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    /// Whether rate limiting is enabled.
+    pub enabled: bool,
+    /// Default requests per minute.
+    pub default_rpm: u32,
+    /// Default burst size.
+    pub default_burst: u32,
+    /// Rate limit rules.
+    pub rules: Vec<RateLimitRule>,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_rpm: 60,
+            default_burst: 10,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A single rate limit rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RateLimitRule {
+    /// Rule name for diagnostics.
+    pub name: String,
+    /// Tool patterns this rule applies to.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Requests per minute.
+    pub rpm: u32,
+    /// Burst size.
+    pub burst: u32,
+    /// Dimensions to rate limit on (e.g. "session", "operator", "tool", "global").
+    #[serde(default)]
+    pub dimensions: Vec<String>,
+}
+
+/// Cost estimation configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CostConfig {
+    /// Whether cost estimation is enabled.
+    pub enabled: bool,
+    /// Default cost per request.
+    pub default_cost: f64,
+    /// Cost rules.
+    pub rules: Vec<CostRule>,
+}
+
+impl Default for CostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_cost: 0.01,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A single cost rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CostRule {
+    /// Tool patterns this rule applies to.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Cost per request.
+    pub cost: f64,
+    /// Monthly budget limit (None = unlimited).
+    #[serde(default)]
+    pub monthly_budget: Option<f64>,
+}
+
 /// Resolve `${VAR_NAME}` references in a string to environment variables.
 pub fn resolve_env_vars(value: &str) -> String {
     if let Some(var_name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
@@ -247,5 +390,96 @@ mod tests {
     fn missing_file_returns_defaults() {
         let cfg = load_config(Path::new("/nonexistent/bulwark.yaml")).unwrap();
         assert_eq!(cfg.proxy.listen_address, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_tool_mapping_config() {
+        let yaml = r#"
+proxy:
+  tool_mappings:
+    - url_pattern: "api.openai.com/*"
+      tool: openai
+      action_from: "url_path"
+    - url_pattern: "*.github.com/api/*"
+      tool: github
+      action_from: "method"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.proxy.tool_mappings.len(), 2);
+        assert_eq!(cfg.proxy.tool_mappings[0].tool, "openai");
+        assert_eq!(cfg.proxy.tool_mappings[0].action_from, ActionFrom::UrlPath);
+        assert_eq!(cfg.proxy.tool_mappings[1].action_from, ActionFrom::Method);
+    }
+
+    #[test]
+    fn test_rate_limit_config() {
+        let yaml = r#"
+rate_limit:
+  enabled: true
+  default_rpm: 120
+  default_burst: 20
+  rules:
+    - name: openai-limit
+      tools: ["openai"]
+      rpm: 30
+      burst: 5
+      dimensions: ["session", "operator"]
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.default_rpm, 120);
+        assert_eq!(cfg.rate_limit.default_burst, 20);
+        assert_eq!(cfg.rate_limit.rules.len(), 1);
+        assert_eq!(cfg.rate_limit.rules[0].name, "openai-limit");
+        assert_eq!(cfg.rate_limit.rules[0].rpm, 30);
+        assert_eq!(
+            cfg.rate_limit.rules[0].dimensions,
+            vec!["session", "operator"]
+        );
+    }
+
+    #[test]
+    fn test_cost_config() {
+        let yaml = r#"
+cost_estimation:
+  enabled: true
+  default_cost: 0.05
+  rules:
+    - tools: ["openai"]
+      cost: 0.10
+      monthly_budget: 100.0
+    - tools: ["github"]
+      cost: 0.001
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.cost_estimation.enabled);
+        assert!((cfg.cost_estimation.default_cost - 0.05).abs() < f64::EPSILON);
+        assert_eq!(cfg.cost_estimation.rules.len(), 2);
+        assert!((cfg.cost_estimation.rules[0].cost - 0.10).abs() < f64::EPSILON);
+        assert_eq!(cfg.cost_estimation.rules[0].monthly_budget, Some(100.0));
+        assert_eq!(cfg.cost_estimation.rules[1].monthly_budget, None);
+    }
+
+    #[test]
+    fn test_action_from_variants() {
+        // url_path
+        let v: ActionFrom = serde_yaml::from_str("\"url_path\"").unwrap();
+        assert_eq!(v, ActionFrom::UrlPath);
+
+        // method
+        let v: ActionFrom = serde_yaml::from_str("\"method\"").unwrap();
+        assert_eq!(v, ActionFrom::Method);
+
+        // path_segment:2
+        let v: ActionFrom = serde_yaml::from_str("\"path_segment:2\"").unwrap();
+        assert_eq!(v, ActionFrom::PathSegment(2));
+
+        // static:read
+        let v: ActionFrom = serde_yaml::from_str("\"static:read\"").unwrap();
+        assert_eq!(v, ActionFrom::Static("read".to_string()));
+
+        // invalid
+        let result: Result<ActionFrom, _> = serde_yaml::from_str("\"bogus\"");
+        assert!(result.is_err());
     }
 }

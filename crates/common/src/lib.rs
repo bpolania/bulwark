@@ -41,6 +41,10 @@ pub enum BulwarkError {
     #[error("inspect error: {0}")]
     Inspect(String),
 
+    /// A rate-limiting error.
+    #[error("rate limit: {0}")]
+    RateLimit(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

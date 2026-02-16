@@ -246,13 +246,77 @@ async fn forward_tls_request(
         None
     };
 
+    // Resolve tool/action via tool mapper if present.
+    let (resolved_tool, resolved_action) = if let Some(mapper) = &ctx.tool_mapper {
+        match mapper.resolve(&url, method.as_str()) {
+            Some(resolved) => (resolved.tool, resolved.action),
+            None => (host.clone(), format!("{} {}", method, path)),
+        }
+    } else {
+        (host.clone(), format!("{} {}", method, path))
+    };
+
+    // Check rate limit if limiter is configured.
+    if let Some(limiter) = &ctx.rate_limiter {
+        let session_id = session.as_ref().map(|s| s.id.as_str());
+        let operator = session.as_ref().map(|s| s.operator.as_str());
+        if let Err(denial) = limiter.check_rate_limit(session_id, operator, &resolved_tool) {
+            tracing::warn!(
+                rule = %denial.rule_name,
+                dimension = %denial.dimension,
+                tool = %resolved_tool,
+                "rate limit denied HTTPS request"
+            );
+            // Emit audit event for rate-limited request.
+            if let Some(ref logger) = ctx.audit_logger {
+                let mut builder = AuditEvent::builder(EventType::RateLimited, Channel::HttpsProxy)
+                    .outcome(EventOutcome::Denied)
+                    .request(RequestInfo {
+                        tool: resolved_tool.clone(),
+                        action: resolved_action.clone(),
+                        resource: None,
+                        target: url.clone(),
+                    })
+                    .error(bulwark_audit::event::ErrorInfo {
+                        category: "rate_limit".to_string(),
+                        message: format!(
+                            "rule={} dimension={}",
+                            denial.rule_name, denial.dimension
+                        ),
+                    });
+                if let Some(ref s) = session {
+                    builder = builder.session(SessionInfo {
+                        session_id: s.id.clone(),
+                        operator: s.operator.clone(),
+                        team: s.team.clone(),
+                        project: s.project.clone(),
+                        environment: s.environment.clone(),
+                        agent_type: s.agent_type.clone(),
+                    });
+                }
+                logger.log(builder.build());
+            }
+            let mut resp = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("Rate limited: {}", denial.rule_name),
+            );
+            if let Some(retry_after) = denial.retry_after_secs {
+                if let Ok(val) =
+                    format!("{}", retry_after.ceil() as u64).parse::<hyper::header::HeaderValue>()
+                {
+                    resp.headers_mut().insert("retry-after", val);
+                }
+            }
+            return Ok(resp);
+        }
+    }
+
     // Evaluate policy if engine is configured.
     if let Some(engine) = &ctx.policy_engine {
         use bulwark_policy::context::RequestContext;
         use bulwark_policy::verdict::Verdict;
 
-        let action = format!("{} {}", method, path);
-        let mut pctx = RequestContext::new(target_host, action);
+        let mut pctx = RequestContext::new(&resolved_tool, &resolved_action);
         if let Some(ref s) = session {
             pctx = pctx.with_operator(&s.operator);
             if let Some(ref team) = s.team {
@@ -607,14 +671,44 @@ async fn forward_tls_request(
                 error: None,
             });
 
+            // Record cost if tracker is configured.
+            if let Some(tracker) = &ctx.cost_tracker {
+                if let Some(ref s) = session {
+                    let cost = tracker.estimate_cost(&resolved_tool);
+                    if let Err(e) = tracker.record_cost(&s.operator, cost) {
+                        tracing::warn!(operator = %s.operator, error = %e, "budget exceeded");
+                        // Emit audit event for budget exceeded.
+                        if let Some(ref logger) = ctx.audit_logger {
+                            let mut builder =
+                                AuditEvent::builder(EventType::BudgetExceeded, Channel::HttpsProxy)
+                                    .outcome(EventOutcome::Denied)
+                                    .request(RequestInfo {
+                                        tool: resolved_tool.clone(),
+                                        action: resolved_action.clone(),
+                                        resource: None,
+                                        target: url.clone(),
+                                    })
+                                    .error(bulwark_audit::event::ErrorInfo {
+                                        category: "budget".to_string(),
+                                        message: e.to_string(),
+                                    });
+                            if let Some(ref si) = audit_session {
+                                builder = builder.session(si.clone());
+                            }
+                            logger.log(builder.build());
+                        }
+                    }
+                }
+            }
+
             // Emit audit event.
             if let Some(ref logger) = ctx.audit_logger {
                 let mut builder =
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
                         .outcome(EventOutcome::Success)
                         .request(RequestInfo {
-                            tool: host.clone(),
-                            action: method.to_string(),
+                            tool: resolved_tool.clone(),
+                            action: resolved_action.clone(),
                             resource: None,
                             target: url.clone(),
                         })
@@ -654,8 +748,8 @@ async fn forward_tls_request(
                     AuditEvent::builder(EventType::RequestProcessed, Channel::HttpsProxy)
                         .outcome(EventOutcome::Failed)
                         .request(RequestInfo {
-                            tool: host.clone(),
-                            action: method.to_string(),
+                            tool: resolved_tool.clone(),
+                            action: resolved_action.clone(),
                             resource: None,
                             target: url.clone(),
                         })

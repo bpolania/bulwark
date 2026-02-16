@@ -11,4 +11,5 @@ pub mod handler;
 pub mod logging;
 pub mod server;
 pub mod tls;
+pub mod toolmap;
 pub mod tunnel;

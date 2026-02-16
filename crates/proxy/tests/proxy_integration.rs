@@ -33,6 +33,7 @@ async fn start_test_proxy(ca_dir: &str) -> (SocketAddr, CancellationToken, Arc<P
         tls: bulwark_config::TlsConfig {
             ca_dir: ca_dir.to_string(),
         },
+        tool_mappings: Vec::new(),
     };
 
     let server = Arc::new(ProxyServer::new(config).await.expect("proxy server"));
@@ -313,6 +314,7 @@ async fn start_test_proxy_with_policy(
         tls: bulwark_config::TlsConfig {
             ca_dir: ca_dir.to_string(),
         },
+        tool_mappings: Vec::new(),
     };
 
     let server = Arc::new(
@@ -442,6 +444,7 @@ async fn start_test_proxy_with_vault(
         tls: bulwark_config::TlsConfig {
             ca_dir: ca_dir.to_string(),
         },
+        tool_mappings: Vec::new(),
     };
 
     let server = Arc::new(
@@ -801,6 +804,7 @@ async fn http_request_produces_audit_event() {
         tls: bulwark_config::TlsConfig {
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
+        tool_mappings: Vec::new(),
     };
 
     let server = Arc::new(
@@ -871,6 +875,7 @@ async fn start_test_proxy_with_scanner(
         tls: bulwark_config::TlsConfig {
             ca_dir: ca_dir.to_string(),
         },
+        tool_mappings: Vec::new(),
     };
 
     // Need an allow-all policy so the request reaches content inspection.
@@ -1549,6 +1554,418 @@ async fn https_connect_tunnel() {
             eprintln!("HTTPS tunnel test skipped (network error): {e}");
         }
     }
+
+    token.cancel();
+}
+
+// ── Phase 1G: Tool mapping + Rate limiting integration tests ──────────
+
+use bulwark_config::ToolMapping;
+use bulwark_proxy::toolmap::ToolMapper;
+use bulwark_ratelimit::limiter::RateLimiter;
+
+/// Start a Bulwark proxy with a tool mapper and policy engine.
+async fn start_test_proxy_with_toolmap(
+    ca_dir: &str,
+    mapper: Arc<ToolMapper>,
+    engine: Arc<PolicyEngine>,
+) -> (SocketAddr, CancellationToken) {
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_tool_mapper(mapper),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.expect("proxy run");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (addr, token)
+}
+
+#[tokio::test]
+async fn test_tool_mapping_affects_policy() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Map the echo server's host to tool "echo".
+    let mapper = Arc::new(
+        ToolMapper::new(vec![ToolMapping {
+            url_pattern: format!("{}/*", echo_addr),
+            tool: "echo".to_string(),
+            action_from: bulwark_config::ActionFrom::UrlPath,
+        }])
+        .unwrap(),
+    );
+
+    // Policy denies tool "echo".
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: deny-echo
+    verdict: deny
+    reason: "echo tool denied"
+    match:
+      tools: ["echo"]
+"#,
+    );
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_toolmap(ca_dir.to_str().unwrap(), mapper, engine).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/api/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "request should be denied because tool mapper maps to 'echo' which is denied by policy"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Policy denied"),
+        "error should mention policy denial, got: {body}",
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn test_rate_limit_denies_excess() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Allow-all policy so rate limit is the only blocker.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // Rate limit: 60 RPM, burst=2, global dimension.
+    let limiter = Arc::new(
+        RateLimiter::new(vec![bulwark_config::RateLimitRule {
+            name: "test-limit".to_string(),
+            tools: vec!["*".to_string()],
+            rpm: 60,
+            burst: 2,
+            dimensions: vec!["global".to_string()],
+        }])
+        .unwrap(),
+    );
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_rate_limiter(limiter),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // First 2 requests should succeed (burst=2).
+    for i in 0..2 {
+        let resp = client
+            .get(format!("http://{echo_addr}/test/{i}"))
+            .send()
+            .await
+            .expect("proxied request");
+        assert_eq!(resp.status(), 200, "request {i} should succeed");
+    }
+
+    // Third request should be rate limited (429).
+    let resp = client
+        .get(format!("http://{echo_addr}/test/3"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        429,
+        "third request should be rate limited (burst=2)"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn test_rate_limit_per_session() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+    let vault_dir = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    let echo_addr = start_echo_server().await;
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // Rate limit: burst=1, per-session dimension.
+    let limiter = Arc::new(
+        RateLimiter::new(vec![bulwark_config::RateLimitRule {
+            name: "session-limit".to_string(),
+            tools: vec!["*".to_string()],
+            rpm: 60,
+            burst: 1,
+            dimensions: vec!["session".to_string()],
+        }])
+        .unwrap(),
+    );
+
+    let vault = test_vault_optional(&vault_dir);
+
+    // Create two sessions.
+    let session_a = vault
+        .create_session(CreateSessionParams {
+            operator: "alice".to_string(),
+            team: None,
+            project: None,
+            environment: None,
+            agent_type: None,
+            ttl_seconds: None,
+            description: None,
+        })
+        .unwrap();
+    let session_b = vault
+        .create_session(CreateSessionParams {
+            operator: "bob".to_string(),
+            team: None,
+            project: None,
+            environment: None,
+            agent_type: None,
+            ttl_seconds: None,
+            description: None,
+        })
+        .unwrap();
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_str().unwrap().to_string(),
+        },
+        tool_mappings: Vec::new(),
+    };
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_vault(Arc::new(parking_lot::Mutex::new(vault)))
+            .with_rate_limiter(limiter),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // Session A: first request succeeds.
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("X-Bulwark-Session", &session_a.token)
+        .send()
+        .await
+        .expect("proxied request");
+    assert_eq!(resp.status(), 200, "session A first request should succeed");
+
+    // Session A: second request gets rate limited.
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("X-Bulwark-Session", &session_a.token)
+        .send()
+        .await
+        .expect("proxied request");
+    assert_eq!(
+        resp.status(),
+        429,
+        "session A second request should be rate limited"
+    );
+
+    // Session B: still has its own bucket, should succeed.
+    let resp = client
+        .get(format!("http://{echo_addr}/test"))
+        .header("X-Bulwark-Session", &session_b.token)
+        .send()
+        .await
+        .expect("proxied request");
+    assert_eq!(
+        resp.status(),
+        200,
+        "session B first request should succeed (separate bucket)"
+    );
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn test_cross_agent_same_policy() {
+    // This test proves one policy YAML governs both MCP and HTTP identically.
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+
+    // Policy denies tool "echo" with action matching "dangerous*".
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: deny-dangerous
+    verdict: deny
+    reason: "dangerous action denied"
+    priority: 10
+    match:
+      tools: ["echo"]
+      actions: ["dangerous*"]
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // HTTP proxy: tool mapper resolves to tool=echo, action=dangerous_action.
+    let mapper = Arc::new(
+        ToolMapper::new(vec![ToolMapping {
+            url_pattern: format!("{}/*", echo_addr),
+            tool: "echo".to_string(),
+            action_from: bulwark_config::ActionFrom::Static("dangerous_action".to_string()),
+        }])
+        .unwrap(),
+    );
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_toolmap(ca_dir.to_str().unwrap(), mapper, engine.clone()).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // HTTP proxy should deny because tool=echo, action=dangerous_action matches deny-dangerous.
+    let resp = client
+        .get(format!("http://{echo_addr}/api/data"))
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "HTTP proxy should deny dangerous action via tool mapper"
+    );
+
+    // MCP gateway: same engine. Tool "echo" with action "dangerous_action" should also be denied.
+    // We test this by directly evaluating the policy engine (since full MCP integration
+    // requires an upstream server process).
+    use bulwark_policy::context::RequestContext;
+    use bulwark_policy::verdict::Verdict;
+
+    let mcp_ctx = RequestContext::new("echo", "dangerous_action");
+    let eval = engine.evaluate(&mcp_ctx);
+    assert_eq!(
+        eval.verdict,
+        Verdict::Deny,
+        "MCP gateway policy should deny echo/dangerous_action"
+    );
+    assert_eq!(eval.matched_rule.as_deref(), Some("deny-dangerous"));
+
+    // And a safe action should be allowed.
+    let safe_ctx = RequestContext::new("echo", "safe_read");
+    let safe_eval = engine.evaluate(&safe_ctx);
+    assert_eq!(
+        safe_eval.verdict,
+        Verdict::Allow,
+        "safe action should be allowed by both"
+    );
 
     token.cancel();
 }

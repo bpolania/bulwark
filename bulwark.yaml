@@ -2,6 +2,13 @@ proxy:
   listen_address: "127.0.0.1:8080"
   tls:
     ca_dir: "~/.bulwark/ca"
+  tool_mappings:
+    - url_pattern: "api.openai.com/*"
+      tool: openai
+      action_from: "url_path"
+    - url_pattern: "*.github.com/*"
+      tool: github
+      action_from: "method"
 
 logging:
   format: json
@@ -24,6 +31,27 @@ inspect:
   inspect_requests: true
   inspect_responses: true
   max_content_size: 1048576
+
+rate_limit:
+  enabled: false
+  default_rpm: 60
+  default_burst: 10
+  rules: []
+  # Example:
+  # - name: openai-limit
+  #   tools: ["openai"]
+  #   rpm: 30
+  #   burst: 5
+  #   dimensions: ["session", "operator"]
+
+cost_estimation:
+  enabled: false
+  default_cost: 0.01
+  rules: []
+  # Example:
+  # - tools: ["openai"]
+  #   cost: 0.10
+  #   monthly_budget: 100.0
 
 # mcp_gateway:
 #   upstream_servers:

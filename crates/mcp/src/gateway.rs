@@ -10,6 +10,8 @@ use bulwark_audit::logger::AuditLogger;
 use bulwark_config::McpGatewayConfig;
 use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
+use bulwark_ratelimit::cost::CostTracker;
+use bulwark_ratelimit::limiter::RateLimiter;
 use bulwark_vault::session::Session;
 use bulwark_vault::store::Vault;
 
@@ -17,7 +19,8 @@ use crate::governance::{governance_metadata, governance_metadata_stub};
 use crate::types::{
     CONTENT_BLOCKED, INTERNAL_ERROR, INVALID_REQUEST, InitializeResult, JsonRpcMessage,
     JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, POLICY_DENIED, POLICY_ESCALATED,
-    SESSION_REQUIRED, ServerCapabilities, ServerInfo, Tool, ToolCallParams, ToolsCapability,
+    RATE_LIMITED, SESSION_REQUIRED, ServerCapabilities, ServerInfo, Tool, ToolCallParams,
+    ToolsCapability,
 };
 use crate::upstream::UpstreamServer;
 
@@ -30,6 +33,8 @@ pub struct McpGateway {
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
     content_scanner: Option<Arc<ContentScanner>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    cost_tracker: Option<Arc<CostTracker>>,
     /// Session token set by the agent (e.g. via an initialize param or header).
     session_token: parking_lot::Mutex<Option<String>>,
 }
@@ -52,6 +57,8 @@ impl McpGateway {
             vault: None,
             audit_logger: None,
             content_scanner: None,
+            rate_limiter: None,
+            cost_tracker: None,
             session_token: parking_lot::Mutex::new(None),
         })
     }
@@ -67,6 +74,8 @@ impl McpGateway {
             vault: None,
             audit_logger: None,
             content_scanner: None,
+            rate_limiter: None,
+            cost_tracker: None,
             session_token: parking_lot::Mutex::new(None),
         }
     }
@@ -92,6 +101,18 @@ impl McpGateway {
     /// Attach a content scanner for request/response inspection.
     pub fn with_content_scanner(mut self, scanner: Arc<ContentScanner>) -> Self {
         self.content_scanner = Some(scanner);
+        self
+    }
+
+    /// Attach a rate limiter.
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Attach a cost tracker.
+    pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
+        self.cost_tracker = Some(tracker);
         self
     }
 
@@ -305,6 +326,48 @@ impl McpGateway {
             environment: s.environment.clone(),
             agent_type: s.agent_type.clone(),
         });
+
+        // Check rate limit before policy evaluation (fail-fast).
+        if let Some(limiter) = &self.rate_limiter {
+            let session_id = session.as_ref().map(|s| s.id.as_str());
+            let operator = session.as_ref().map(|s| s.operator.as_str());
+            if let Err(denial) = limiter.check_rate_limit(session_id, operator, server_name) {
+                tracing::warn!(
+                    rule = %denial.rule_name,
+                    dimension = %denial.dimension,
+                    tool = %params.name,
+                    "rate limit denied MCP tool call"
+                );
+                // Emit audit event for rate-limited MCP request.
+                if let Some(ref logger) = self.audit_logger {
+                    let mut builder =
+                        AuditEvent::builder(EventType::RateLimited, Channel::McpGateway)
+                            .outcome(EventOutcome::Denied)
+                            .request(RequestInfo {
+                                tool: server_name.to_string(),
+                                action: tool_name.to_string(),
+                                resource: None,
+                                target: params.name.clone(),
+                            })
+                            .error(ErrorInfo {
+                                category: "rate_limit".to_string(),
+                                message: format!(
+                                    "rule={} dimension={}",
+                                    denial.rule_name, denial.dimension
+                                ),
+                            });
+                    if let Some(ref si) = audit_session {
+                        builder = builder.session(si.clone());
+                    }
+                    logger.log(builder.build());
+                }
+                return JsonRpcResponse::error(
+                    req.id.clone(),
+                    RATE_LIMITED,
+                    format!("Rate limited: {}", denial.rule_name),
+                );
+            }
+        }
 
         // Evaluate policy before upstream lookup (fail-fast on denial).
         let mut policy_info: Option<PolicyInfo> = None;
@@ -585,6 +648,38 @@ impl McpGateway {
                     .iter()
                     .chain(response_inspection.findings.iter())
                     .collect();
+
+                // Record cost if tracker is configured.
+                if let Some(tracker) = &self.cost_tracker {
+                    if let Some(ref s) = session {
+                        let cost = tracker.estimate_cost(server_name);
+                        if let Err(e) = tracker.record_cost(&s.operator, cost) {
+                            tracing::warn!(operator = %s.operator, error = %e, "budget exceeded");
+                            // Emit audit event for budget exceeded.
+                            if let Some(ref logger) = self.audit_logger {
+                                let mut builder = AuditEvent::builder(
+                                    EventType::BudgetExceeded,
+                                    Channel::McpGateway,
+                                )
+                                .outcome(EventOutcome::Denied)
+                                .request(RequestInfo {
+                                    tool: server_name.to_string(),
+                                    action: tool_name.to_string(),
+                                    resource: None,
+                                    target: params.name.clone(),
+                                })
+                                .error(ErrorInfo {
+                                    category: "budget".to_string(),
+                                    message: e.to_string(),
+                                });
+                                if let Some(ref si) = audit_session {
+                                    builder = builder.session(si.clone());
+                                }
+                                logger.log(builder.build());
+                            }
+                        }
+                    }
+                }
 
                 // Build and emit audit event for successful tool call.
                 let audit_event_id = if let Some(ref logger) = self.audit_logger {

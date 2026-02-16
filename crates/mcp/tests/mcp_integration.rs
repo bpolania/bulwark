@@ -10,7 +10,7 @@ use bulwark_mcp::gateway::McpGateway;
 use bulwark_mcp::transport::stdio::StdioTransport;
 use bulwark_mcp::types::{
     CONTENT_BLOCKED, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    POLICY_DENIED, RequestId, Tool, ToolCallParams,
+    POLICY_DENIED, RATE_LIMITED, RequestId, Tool, ToolCallParams,
 };
 use bulwark_policy::engine::PolicyEngine;
 use tokio::io::{DuplexStream, duplex};
@@ -1086,4 +1086,76 @@ rules:
     }
 
     gateway.shutdown().await;
+}
+
+// ── Rate limit integration tests ──────────────────────────────────
+
+#[tokio::test]
+async fn mcp_rate_limit_denies_excess() {
+    use bulwark_ratelimit::limiter::RateLimiter;
+
+    // Allow all via policy.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    // Rate limit: burst=2, 60 RPM, global dimension.
+    let limiter = Arc::new(
+        RateLimiter::new(vec![bulwark_config::RateLimitRule {
+            name: "test-limit".to_string(),
+            tools: vec!["*".to_string()],
+            rpm: 60,
+            burst: 2,
+            dimensions: vec!["global".to_string()],
+        }])
+        .unwrap(),
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new())
+        .with_policy_engine(engine)
+        .with_rate_limiter(limiter);
+
+    // First two requests: policy allows but no upstream → "Unknown server" error (not rate limited).
+    for i in 1..=2 {
+        let resp = gateway
+            .handle_message(tool_call_request(i, "mock__read"))
+            .await
+            .unwrap();
+        if let JsonRpcMessage::Response(r) = resp {
+            let err = r.error.expect("should error (no upstream)");
+            assert_ne!(
+                err.code, RATE_LIMITED,
+                "request {i} should NOT be rate-limited"
+            );
+        } else {
+            panic!("Expected response for request {i}");
+        }
+    }
+
+    // Third request: should be rate-limited (burst=2 exceeded).
+    let resp = gateway
+        .handle_message(tool_call_request(3, "mock__read"))
+        .await
+        .unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("should be rate-limited");
+        assert_eq!(
+            err.code, RATE_LIMITED,
+            "expected RATE_LIMITED (-32004), got: {}",
+            err.code
+        );
+        assert!(
+            err.message.contains("Rate limited"),
+            "expected rate limit message, got: {}",
+            err.message
+        );
+    } else {
+        panic!("Expected response for rate-limited request");
+    }
 }

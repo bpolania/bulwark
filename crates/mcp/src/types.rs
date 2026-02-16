@@ -12,6 +12,7 @@ pub const POLICY_DENIED: i64 = -32000;
 pub const POLICY_ESCALATED: i64 = -32001;
 pub const SESSION_REQUIRED: i64 = -32002;
 pub const CONTENT_BLOCKED: i64 = -32003;
+pub const RATE_LIMITED: i64 = -32004;
 
 // ── JSON-RPC 2.0 primitives ─────────────────────────────────────────
 
