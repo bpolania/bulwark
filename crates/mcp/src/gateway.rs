@@ -8,15 +8,16 @@ use bulwark_audit::event::{
 };
 use bulwark_audit::logger::AuditLogger;
 use bulwark_config::McpGatewayConfig;
+use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::session::Session;
 use bulwark_vault::store::Vault;
 
 use crate::governance::{governance_metadata, governance_metadata_stub};
 use crate::types::{
-    INTERNAL_ERROR, INVALID_REQUEST, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, METHOD_NOT_FOUND, POLICY_DENIED, POLICY_ESCALATED, SESSION_REQUIRED,
-    ServerCapabilities, ServerInfo, Tool, ToolCallParams, ToolsCapability,
+    CONTENT_BLOCKED, INTERNAL_ERROR, INVALID_REQUEST, InitializeResult, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, POLICY_DENIED, POLICY_ESCALATED,
+    SESSION_REQUIRED, ServerCapabilities, ServerInfo, Tool, ToolCallParams, ToolsCapability,
 };
 use crate::upstream::UpstreamServer;
 
@@ -28,6 +29,7 @@ pub struct McpGateway {
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
     /// Session token set by the agent (e.g. via an initialize param or header).
     session_token: parking_lot::Mutex<Option<String>>,
 }
@@ -49,6 +51,7 @@ impl McpGateway {
             policy_engine: None,
             vault: None,
             audit_logger: None,
+            content_scanner: None,
             session_token: parking_lot::Mutex::new(None),
         })
     }
@@ -63,6 +66,7 @@ impl McpGateway {
             policy_engine: None,
             vault: None,
             audit_logger: None,
+            content_scanner: None,
             session_token: parking_lot::Mutex::new(None),
         }
     }
@@ -82,6 +86,12 @@ impl McpGateway {
     /// Attach an audit logger for event logging.
     pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
         self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Attach a content scanner for request/response inspection.
+    pub fn with_content_scanner(mut self, scanner: Arc<ContentScanner>) -> Self {
+        self.content_scanner = Some(scanner);
         self
     }
 
@@ -413,6 +423,47 @@ impl McpGateway {
             }
         }
 
+        // Inspect request arguments for sensitive content.
+        let mut request_inspection = bulwark_inspect::InspectionResult::empty(0);
+        if let Some(ref scanner) = self.content_scanner {
+            if let Some(ref args) = params.arguments {
+                request_inspection = scanner.scan_json(args);
+                if request_inspection.should_block {
+                    tracing::warn!(
+                        tool = %params.name,
+                        findings = request_inspection.findings.len(),
+                        "Content inspection blocked request"
+                    );
+
+                    if let Some(ref logger) = self.audit_logger {
+                        let mut builder =
+                            AuditEvent::builder(EventType::RequestProcessed, Channel::McpGateway)
+                                .outcome(EventOutcome::Denied)
+                                .request(RequestInfo {
+                                    tool: server_name.to_string(),
+                                    action: tool_name.to_string(),
+                                    resource: None,
+                                    target: params.name.clone(),
+                                })
+                                .duration_us(start.elapsed().as_micros() as u64);
+                        if let Some(ref si) = audit_session {
+                            builder = builder.session(si.clone());
+                        }
+                        if let Some(ref pi) = policy_info {
+                            builder = builder.policy(pi.clone());
+                        }
+                        logger.log(builder.build());
+                    }
+
+                    return JsonRpcResponse::error(
+                        req.id.clone(),
+                        CONTENT_BLOCKED,
+                        "Request blocked by content inspection".to_string(),
+                    );
+                }
+            }
+        }
+
         // Find upstream server.
         let upstream = match self.upstreams.get(server_name) {
             Some(u) => u,
@@ -440,6 +491,28 @@ impl McpGateway {
                     is_error = tool_result.is_error.unwrap_or(false),
                     "Tool call complete"
                 );
+
+                // Inspect response content.
+                let mut response_inspection = bulwark_inspect::InspectionResult::empty(0);
+                if let Some(ref scanner) = self.content_scanner {
+                    let result_json = serde_json::to_value(&tool_result).unwrap_or_default();
+                    response_inspection = scanner.scan_json(&result_json);
+                    if !response_inspection.findings.is_empty() {
+                        tracing::info!(
+                            findings = response_inspection.findings.len(),
+                            blocked = response_inspection.should_block,
+                            redacted = response_inspection.should_redact,
+                            "Content inspection findings in response"
+                        );
+                    }
+                }
+
+                // Combine request and response findings for governance metadata.
+                let all_findings: Vec<&bulwark_inspect::InspectionFinding> = request_inspection
+                    .findings
+                    .iter()
+                    .chain(response_inspection.findings.iter())
+                    .collect();
 
                 // Build and emit audit event for successful tool call.
                 let audit_event_id = if let Some(ref logger) = self.audit_logger {
@@ -478,13 +551,40 @@ impl McpGateway {
                     } else {
                         governance_metadata_stub()
                     };
-                    // Add session_id and audit_event_id to governance metadata.
+                    // Add session_id, audit_event_id, and inspection_results to governance metadata.
                     if let Some(gov) = meta.get_mut("governance") {
                         if let Some(ref s) = session {
                             gov["session_id"] = serde_json::Value::String(s.id.clone());
                         }
                         if let Some(ref id) = audit_event_id {
                             gov["audit_event_id"] = serde_json::Value::String(id.clone());
+                        }
+                        // Inspection summary — NO snippets to avoid leaking secrets.
+                        if all_findings.is_empty() {
+                            gov["inspection_results"] = serde_json::Value::Null;
+                        } else {
+                            use std::collections::HashSet;
+                            let categories: Vec<String> = all_findings
+                                .iter()
+                                .map(|f| serde_json::to_value(&f.category).unwrap_or_default())
+                                .map(|v| v.as_str().unwrap_or("unknown").to_string())
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
+                            let max_sev = all_findings.iter().map(|f| f.severity).max();
+                            let any_blocked = all_findings
+                                .iter()
+                                .any(|f| f.action == bulwark_inspect::FindingAction::Block);
+                            let any_redacted = all_findings
+                                .iter()
+                                .any(|f| f.action == bulwark_inspect::FindingAction::Redact);
+                            gov["inspection_results"] = serde_json::json!({
+                                "finding_count": all_findings.len(),
+                                "max_severity": serde_json::to_value(max_sev).unwrap_or_default(),
+                                "blocked": any_blocked,
+                                "redacted": any_redacted,
+                                "categories": categories,
+                            });
                         }
                     }
                     obj.insert("_meta".to_string(), meta);

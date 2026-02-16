@@ -54,6 +54,7 @@ pub fn start(
 
     let vault_config = config.vault.clone();
     let audit_config = config.audit.clone();
+    let inspect_config = config.inspect.clone();
 
     rt.block_on(async {
         let mut server = ProxyServer::new(config.proxy)
@@ -140,6 +141,24 @@ pub fn start(
         } else {
             None
         };
+
+        // Load content scanner if inspection is enabled.
+        if inspect_config.enabled {
+            match bulwark_inspect::scanner::ContentScanner::from_config(&inspect_config) {
+                Ok(scanner) => {
+                    tracing::info!(
+                        rules = scanner.rule_set().enabled_count(),
+                        "content inspection enabled"
+                    );
+                    server = server.with_content_scanner(Arc::new(scanner));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create content scanner, running without inspection");
+                }
+            }
+        } else {
+            tracing::info!("content inspection disabled");
+        }
 
         let shutdown_token = server.shutdown_token();
 

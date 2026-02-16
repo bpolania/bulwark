@@ -65,6 +65,11 @@ enum Commands {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Test content inspection.
+    Inspect {
+        #[command(subcommand)]
+        action: InspectAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -185,6 +190,28 @@ enum AuditAction {
 }
 
 #[derive(Subcommand)]
+enum InspectAction {
+    /// Scan text or a file for sensitive content.
+    Scan {
+        /// Text to scan (if omitted, reads from stdin).
+        #[arg(long)]
+        text: Option<String>,
+        /// File to scan.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Output format (table, json).
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// List all inspection rules.
+    Rules {
+        /// Show disabled rules too.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionAction {
     /// Create a new session.
     Create {
@@ -284,6 +311,12 @@ fn main() -> Result<()> {
             AuditAction::Stats { since } => commands::audit::stats(&cli.config, since.as_deref()),
             AuditAction::Export { since } => commands::audit::export(&cli.config, since.as_deref()),
             AuditAction::Cleanup { days } => commands::audit::cleanup(&cli.config, days),
+        },
+        Commands::Inspect { action } => match action {
+            InspectAction::Scan { text, file, format } => {
+                commands::inspect::scan(&cli.config, text.as_deref(), file.as_deref(), &format)
+            }
+            InspectAction::Rules { all } => commands::inspect::rules(&cli.config, all),
         },
         Commands::Session { action } => match action {
             SessionAction::Create {

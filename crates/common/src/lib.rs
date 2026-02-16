@@ -37,6 +37,10 @@ pub enum BulwarkError {
     #[error("audit error: {0}")]
     Audit(String),
 
+    /// An inspection-related error.
+    #[error("inspect error: {0}")]
+    Inspect(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

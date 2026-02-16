@@ -19,6 +19,12 @@ audit:
   db_path: "~/.bulwark/audit.db"
   retention_days: 90
 
+inspect:
+  enabled: true
+  inspect_requests: true
+  inspect_responses: true
+  max_content_size: 1048576
+
 # mcp_gateway:
 #   upstream_servers:
 #     - name: github

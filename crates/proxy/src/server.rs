@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use bulwark_audit::logger::AuditLogger;
 use bulwark_config::ProxyConfig;
+use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -27,6 +28,7 @@ pub struct ProxyServer {
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 }
 
 impl ProxyServer {
@@ -44,6 +46,7 @@ impl ProxyServer {
             policy_engine: None,
             vault: None,
             audit_logger: None,
+            content_scanner: None,
         })
     }
 
@@ -62,6 +65,12 @@ impl ProxyServer {
     /// Attach an audit logger for event logging.
     pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
         self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Attach a content scanner for request/response inspection.
+    pub fn with_content_scanner(mut self, scanner: Arc<ContentScanner>) -> Self {
+        self.content_scanner = Some(scanner);
         self
     }
 
@@ -157,6 +166,7 @@ impl ProxyServer {
         let policy_engine = self.policy_engine.clone();
         let vault = self.vault.clone();
         let audit_logger = self.audit_logger.clone();
+        let content_scanner = self.content_scanner.clone();
 
         tokio::spawn(async move {
             let service = service_fn(move |req| {
@@ -164,8 +174,12 @@ impl ProxyServer {
                 let policy = policy_engine.clone();
                 let vault = vault.clone();
                 let audit = audit_logger.clone();
+                let scanner = content_scanner.clone();
                 async move {
-                    handler::handle_request(req, addr, tls, start_time, policy, vault, audit).await
+                    handler::handle_request(
+                        req, addr, tls, start_time, policy, vault, audit, scanner,
+                    )
+                    .await
                 }
             });
 

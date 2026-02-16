@@ -11,6 +11,7 @@ pub const INTERNAL_ERROR: i64 = -32603;
 pub const POLICY_DENIED: i64 = -32000;
 pub const POLICY_ESCALATED: i64 = -32001;
 pub const SESSION_REQUIRED: i64 = -32002;
+pub const CONTENT_BLOCKED: i64 = -32003;
 
 // ── JSON-RPC 2.0 primitives ─────────────────────────────────────────
 

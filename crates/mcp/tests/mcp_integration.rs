@@ -9,8 +9,8 @@ use std::sync::Arc;
 use bulwark_mcp::gateway::McpGateway;
 use bulwark_mcp::transport::stdio::StdioTransport;
 use bulwark_mcp::types::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, POLICY_DENIED, RequestId,
-    Tool, ToolCallParams,
+    CONTENT_BLOCKED, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    POLICY_DENIED, RequestId, Tool, ToolCallParams,
 };
 use bulwark_policy::engine::PolicyEngine;
 use tokio::io::{DuplexStream, duplex};
@@ -702,4 +702,181 @@ rules:
     assert_eq!(meta["governance"]["reason"], "read operations are safe");
     assert_eq!(meta["governance"]["version"], "0.1.0");
     assert!(meta["governance"]["evaluation_time_us"].is_number());
+}
+
+// ── Content inspection cross-crate integration tests ─────────────────
+
+#[tokio::test]
+async fn mcp_tool_call_blocked_by_content_inspection() {
+    // A tool call whose arguments contain an AWS key should be blocked
+    // by the content scanner before ever reaching an upstream server.
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new())
+        .with_policy_engine(engine)
+        .with_content_scanner(scanner);
+
+    // Build a tools/call with sensitive content in arguments.
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "mock__read",
+            "arguments": {
+                "config": "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+            }
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        let err = r.error.expect("should be blocked by content inspection");
+        assert_eq!(
+            err.code, CONTENT_BLOCKED,
+            "expected CONTENT_BLOCKED (-32003), got: {} — {}",
+            err.code, err.message,
+        );
+        assert!(
+            err.message.contains("content inspection"),
+            "error message should mention content inspection, got: {}",
+            err.message,
+        );
+    } else {
+        panic!("Expected response");
+    }
+}
+
+/// Mock MCP server that returns tool results containing sensitive data.
+const MOCK_MCP_SERVER_WITH_SECRET: &str = r#"
+import sys, json
+def respond(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue
+    method = msg.get("method", "")
+    if method == "initialize":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "1.0"}}})
+    elif method == "tools/list":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "leak", "description": "Leaks a secret", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        respond({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": "Here is the key: AKIAIOSFODNN7EXAMPLE"}]}})
+    else:
+        respond({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}})
+"#;
+
+#[tokio::test]
+async fn mcp_tool_response_inspection_in_governance_metadata() {
+    // When the upstream tool result contains a secret, the content scanner
+    // should detect it and include inspection_results in the governance
+    // metadata — without exposing the actual snippet.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found, skipping test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("mock_secret_server.py");
+    std::fs::write(&script_path, MOCK_MCP_SERVER_WITH_SECRET).unwrap();
+
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-all
+    verdict: allow
+    match:
+      tools: ["*"]
+"#,
+    );
+
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let config = bulwark_config::McpGatewayConfig {
+        upstream_servers: vec![bulwark_config::UpstreamServerConfig {
+            name: "leaky".into(),
+            command: "python3".into(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: Default::default(),
+        }],
+    };
+
+    let gateway = McpGateway::new(config)
+        .await
+        .unwrap()
+        .with_policy_engine(engine)
+        .with_content_scanner(scanner);
+
+    // Call the tool that returns a secret.
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "leaky__leak",
+            "arguments": {}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "tool call should succeed, got: {:?}",
+            r.error
+        );
+        let result = r.result.unwrap();
+
+        // Verify governance metadata includes inspection_results.
+        let meta = &result["_meta"]["governance"];
+        assert!(!meta.is_null(), "governance metadata should be present");
+
+        let inspection = &meta["inspection_results"];
+        assert!(
+            !inspection.is_null(),
+            "inspection_results should be present"
+        );
+        assert!(
+            inspection["finding_count"].as_u64().unwrap() > 0,
+            "should have at least one finding, got: {inspection}",
+        );
+        assert!(
+            inspection["blocked"].as_bool().unwrap(),
+            "should flag as blocked (AWS key triggers block action)",
+        );
+
+        // Verify no snippets are leaked in governance metadata.
+        let meta_str = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !meta_str.contains("AKIAIOSFODNN7"),
+            "governance metadata must NOT contain the actual secret",
+        );
+    } else {
+        panic!("Expected response");
+    }
+
+    gateway.shutdown().await;
 }

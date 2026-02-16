@@ -859,6 +859,110 @@ async fn http_request_produces_audit_event() {
     assert_eq!(event.channel, bulwark_audit::event::Channel::HttpProxy);
 }
 
+// ── Content inspection cross-crate integration test ──────────────────
+
+/// Start a Bulwark proxy with a content scanner attached.
+async fn start_test_proxy_with_scanner(
+    ca_dir: &str,
+    scanner: Arc<bulwark_inspect::scanner::ContentScanner>,
+) -> (SocketAddr, CancellationToken) {
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_string(),
+        },
+    };
+
+    // Need an allow-all policy so the request reaches content inspection.
+    let policy_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        policy_dir.path().join("allow.yaml"),
+        "rules:\n  - name: allow-all\n    verdict: allow\n    match:\n      tools: [\"*\"]\n",
+    )
+    .unwrap();
+    let engine = Arc::new(PolicyEngine::from_directory(policy_dir.path()).unwrap());
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_policy_engine(engine)
+            .with_content_scanner(scanner),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test proxy");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.expect("proxy run");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (addr, token)
+}
+
+#[tokio::test]
+async fn http_request_blocked_by_content_inspection() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tmp dir");
+    let ca_dir = tmp.path().join("ca");
+
+    let echo_addr = start_echo_server().await;
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+
+    let (proxy_addr, token) =
+        start_test_proxy_with_scanner(ca_dir.to_str().unwrap(), scanner).await;
+
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    // POST a body containing an AWS access key — should be blocked.
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body("aws_access_key_id = AKIAIOSFODNN7EXAMPLE")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "request with AWS key in body should be blocked"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("content inspection"),
+        "error should mention content inspection, got: {body}",
+    );
+
+    // Verify clean requests still go through.
+    let resp = client
+        .post(format!("http://{echo_addr}/upload"))
+        .body("just a normal request body with no secrets")
+        .send()
+        .await
+        .expect("proxied request");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "clean request should be forwarded normally"
+    );
+
+    token.cancel();
+}
+
 #[tokio::test]
 async fn https_connect_tunnel() {
     // This test verifies the CONNECT tunnel works with the local CA.

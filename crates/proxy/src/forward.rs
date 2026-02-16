@@ -18,6 +18,7 @@ use bulwark_audit::event::{
     AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
 };
 use bulwark_audit::logger::AuditLogger;
+use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -33,6 +34,7 @@ pub async fn forward_request(
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -155,6 +157,22 @@ pub async fn forward_request(
         }
     };
     let request_bytes = body_bytes.len() as u64;
+
+    // Inspect request body if scanner is configured.
+    if let Some(ref scanner) = content_scanner {
+        let result = scanner.scan_bytes(&body_bytes);
+        if result.should_block {
+            tracing::warn!(
+                host = %host,
+                findings = result.findings.len(),
+                "Content inspection blocked HTTP request"
+            );
+            return Ok(error_response(
+                StatusCode::FORBIDDEN,
+                "Request blocked by content inspection",
+            ));
+        }
+    }
 
     // Build the outbound request, stripping hop-by-hop headers.
     let mut builder = Request::builder().method(parts.method).uri(&uri);

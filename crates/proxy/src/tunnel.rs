@@ -29,6 +29,7 @@ use bulwark_audit::event::{
     AuditEvent, Channel, EventOutcome, EventType, RequestInfo, SessionInfo,
 };
 use bulwark_audit::logger::AuditLogger;
+use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -45,6 +46,7 @@ pub async fn handle_connect(
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // Extract the target host:port from the CONNECT URI.
     let target_authority = match req.uri().authority() {
@@ -92,6 +94,7 @@ pub async fn handle_connect(
     let policy_engine_clone = policy_engine;
     let vault_clone = vault;
     let audit_clone = audit_logger;
+    let scanner_clone = content_scanner;
 
     tokio::spawn(async move {
         // Wait for the HTTP upgrade to complete.
@@ -112,6 +115,7 @@ pub async fn handle_connect(
             policy_engine_clone,
             vault_clone,
             audit_clone,
+            scanner_clone,
         )
         .await
         {
@@ -142,6 +146,7 @@ async fn mitm_tunnel(
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 ) -> bulwark_common::Result<()> {
     // --- Client-side TLS (we are the "server" to the client) ---
     let server_config = ServerConfig::builder()
@@ -185,7 +190,10 @@ async fn mitm_tunnel(
         let policy = policy_engine.clone();
         let vault = vault.clone();
         let audit = audit_logger.clone();
-        async move { forward_tls_request(req, &host, port, connector, policy, vault, audit).await }
+        let scanner = content_scanner.clone();
+        async move {
+            forward_tls_request(req, &host, port, connector, policy, vault, audit, scanner).await
+        }
     });
 
     let conn = http1::Builder::new()
@@ -201,6 +209,7 @@ async fn mitm_tunnel(
 
 /// Forward a single decrypted HTTP request to the real server over a fresh
 /// TLS connection.
+#[allow(clippy::too_many_arguments)]
 async fn forward_tls_request(
     req: Request<Incoming>,
     target_host: &str,
@@ -209,6 +218,7 @@ async fn forward_tls_request(
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -331,6 +341,22 @@ async fn forward_tls_request(
         }
     };
     let request_bytes = body_bytes.len() as u64;
+
+    // Inspect request body if scanner is configured.
+    if let Some(ref scanner) = content_scanner {
+        let result = scanner.scan_bytes(&body_bytes);
+        if result.should_block {
+            tracing::warn!(
+                host = %host,
+                findings = result.findings.len(),
+                "Content inspection blocked HTTPS request"
+            );
+            return Ok(error_response(
+                StatusCode::FORBIDDEN,
+                "Request blocked by content inspection",
+            ));
+        }
+    }
 
     // Connect to the real server.
     let tcp = match tokio::net::TcpStream::connect((target_host, target_port)).await {

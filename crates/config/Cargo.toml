@@ -8,6 +8,7 @@ description = "Bulwark configuration loading and validation"
 
 [dependencies]
 bulwark-common.workspace = true
+bulwark-inspect.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 dirs.workspace = true

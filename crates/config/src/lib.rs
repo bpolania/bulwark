@@ -25,6 +25,8 @@ pub struct BulwarkConfig {
     pub vault: VaultConfig,
     /// Audit settings.
     pub audit: AuditConfig,
+    /// Content inspection settings.
+    pub inspect: bulwark_inspect::config::InspectionConfig,
 }
 
 /// Configuration for the proxy listener.

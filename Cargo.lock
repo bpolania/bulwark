@@ -300,6 +300,7 @@ dependencies = [
  "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
+ "bulwark-inspect",
  "bulwark-mcp",
  "bulwark-policy",
  "bulwark-proxy",
@@ -330,6 +331,7 @@ name = "bulwark-config"
 version = "0.1.0"
 dependencies = [
  "bulwark-common",
+ "bulwark-inspect",
  "dirs",
  "serde",
  "serde_yaml",
@@ -339,6 +341,14 @@ dependencies = [
 [[package]]
 name = "bulwark-inspect"
 version = "0.1.0"
+dependencies = [
+ "bulwark-common",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "bulwark-mcp"
@@ -347,6 +357,7 @@ dependencies = [
  "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
+ "bulwark-inspect",
  "bulwark-policy",
  "bulwark-vault",
  "bytes",
@@ -386,6 +397,7 @@ dependencies = [
  "bulwark-audit",
  "bulwark-common",
  "bulwark-config",
+ "bulwark-inspect",
  "bulwark-policy",
  "bulwark-vault",
  "bytes",

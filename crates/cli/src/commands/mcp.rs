@@ -55,6 +55,7 @@ pub fn start(config_path: &Path, log_level: Option<&str>) -> Result<()> {
     let policies_dir = config.policy.policies_dir.clone();
     let vault_config = config.vault.clone();
     let audit_config = config.audit.clone();
+    let inspect_config = config.inspect.clone();
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async {
@@ -142,6 +143,24 @@ pub fn start(config_path: &Path, log_level: Option<&str>) -> Result<()> {
         } else {
             None
         };
+
+        // Load content scanner if inspection is enabled.
+        if inspect_config.enabled {
+            match bulwark_inspect::scanner::ContentScanner::from_config(&inspect_config) {
+                Ok(scanner) => {
+                    tracing::info!(
+                        rules = scanner.rule_set().enabled_count(),
+                        "content inspection enabled"
+                    );
+                    gateway = gateway.with_content_scanner(Arc::new(scanner));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create content scanner, running without inspection");
+                }
+            }
+        } else {
+            tracing::info!("content inspection disabled");
+        }
 
         let gateway = Arc::new(gateway);
 

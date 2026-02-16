@@ -11,6 +11,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
 
 use bulwark_audit::logger::AuditLogger;
+use bulwark_inspect::scanner::ContentScanner;
 use bulwark_policy::engine::PolicyEngine;
 use bulwark_vault::store::Vault;
 
@@ -25,6 +26,7 @@ use crate::tunnel;
 /// - Absolute URI → HTTP forward proxy
 /// - Relative path `/healthz` → health check
 /// - Everything else → 400 Bad Request
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_request(
     req: Request<Incoming>,
     client_addr: SocketAddr,
@@ -33,6 +35,7 @@ pub async fn handle_request(
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    content_scanner: Option<Arc<ContentScanner>>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
     // CONNECT method → HTTPS tunnel with TLS MITM
     if req.method() == Method::CONNECT {
@@ -43,6 +46,7 @@ pub async fn handle_request(
             policy_engine,
             vault,
             audit_logger,
+            content_scanner,
         )
         .await;
     }
@@ -54,7 +58,15 @@ pub async fn handle_request(
     }
 
     // Absolute URI → forward proxy
-    forward::forward_request(req, client_addr, policy_engine, vault, audit_logger).await
+    forward::forward_request(
+        req,
+        client_addr,
+        policy_engine,
+        vault,
+        audit_logger,
+        content_scanner,
+    )
+    .await
 }
 
 /// Handle requests aimed at Bulwark itself (health check, etc.).
