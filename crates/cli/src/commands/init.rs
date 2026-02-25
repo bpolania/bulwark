@@ -4,6 +4,35 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Prompt the user to install the CA system-wide. Returns `true` if installed.
+fn offer_ca_install(ca_cert: &Path) -> bool {
+    if !ca_cert.exists() {
+        return false;
+    }
+
+    eprintln!();
+    eprint!(
+        "Install CA certificate system-wide? This allows Bulwark to inspect HTTPS traffic. [y/N] "
+    );
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let input = input.trim().to_lowercase();
+    if input != "y" && input != "yes" {
+        return false;
+    }
+
+    match super::ca::try_install_from_init(ca_cert) {
+        Ok(installed) => installed,
+        Err(e) => {
+            eprintln!("  Warning: CA install failed: {e}");
+            false
+        }
+    }
+}
+
 /// Run the `init` command: create project scaffolding in the target directory.
 pub fn run(path: Option<&Path>) -> Result<()> {
     let target = path.unwrap_or_else(|| Path::new("."));
@@ -105,14 +134,30 @@ bindings: []
         println!("  created {bindings_path}");
     }
 
+    // Offer to install the CA system-wide.
+    let ca_installed = offer_ca_install(&ca_cert);
+
     println!();
     println!("Bulwark project initialised in {}", target.display());
     println!();
     println!("Next steps:");
     println!("  1. Edit bulwark.yaml to configure the proxy");
-    println!("  2. Trust the CA certificate at {}/ca.pem", ca_dir);
-    println!("  3. Add credentials with `bulwark cred add <name>`");
-    println!("  4. Run `bulwark proxy start` to launch the proxy");
+    if !ca_installed {
+        println!("  2. Trust the CA: bulwark ca install  (or set env vars manually)");
+        println!("     export NODE_EXTRA_CA_CERTS=\"{}/ca.pem\"", ca_dir);
+        println!("     export REQUESTS_CA_BUNDLE=\"{}/ca.pem\"", ca_dir);
+        println!("     export SSL_CERT_FILE=\"{}/ca.pem\"", ca_dir);
+    } else {
+        println!("  2. CA is already trusted system-wide");
+    }
+    println!(
+        "  {}. Add credentials with `bulwark cred add <name>`",
+        if ca_installed { 2 } else { 3 }
+    );
+    println!(
+        "  {}. Run `bulwark proxy start` to launch the proxy",
+        if ca_installed { 3 } else { 4 }
+    );
 
     Ok(())
 }

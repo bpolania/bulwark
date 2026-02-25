@@ -5,8 +5,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bulwark_config::{expand_tilde, load_config};
 
+use crate::ca_trust;
+
 /// Resolve the CA PEM path from config.
-fn resolve_ca_pem_path(config_path: &Path) -> Result<std::path::PathBuf> {
+pub fn resolve_ca_pem_path(config_path: &Path) -> Result<std::path::PathBuf> {
     let config = load_config(config_path).context("loading configuration")?;
     let ca_dir = expand_tilde(&config.proxy.tls.ca_dir);
     Ok(std::path::PathBuf::from(ca_dir).join("ca.pem"))
@@ -45,6 +47,136 @@ pub fn path(config_path: &Path) -> Result<()> {
 
     println!("{}", absolute.display());
     Ok(())
+}
+
+/// Install the Bulwark CA certificate as a trusted root in the system store.
+pub fn install(config_path: &Path, skip_confirm: bool) -> Result<()> {
+    let ca_pem_path = resolve_ca_pem_path(config_path)?;
+
+    if !ca_pem_path.exists() {
+        anyhow::bail!("CA certificate not found. Run `bulwark init` first.");
+    }
+
+    let platform = ca_trust::detect_platform();
+    eprintln!("Detected platform: {platform}");
+
+    // Confirmation prompt (unless --yes was passed).
+    if !skip_confirm {
+        eprintln!();
+        eprintln!("This will install the Bulwark CA certificate as a trusted root.");
+        eprintln!("Bulwark will be able to intercept HTTPS traffic on this machine.");
+        eprint!("Continue? [y/N] ");
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading confirmation")?;
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let trust_cmd =
+        ca_trust::install_command(&platform, &ca_pem_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!("  {}", trust_cmd.description);
+
+    match ca_trust::execute_trust_command(trust_cmd) {
+        Ok(()) => {
+            eprintln!();
+            eprintln!("CA certificate installed successfully.");
+            eprintln!(
+                "The Bulwark CA is now trusted system-wide. HTTPS MITM inspection is active."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Failed to install CA certificate.\n\n{e}\n\n\
+                 Hint: try running with elevated privileges:\n  \
+                 sudo bulwark ca install --yes"
+            );
+        }
+    }
+}
+
+/// Remove the Bulwark CA certificate from the system trust store.
+pub fn uninstall(config_path: &Path, skip_confirm: bool) -> Result<()> {
+    let ca_pem_path = resolve_ca_pem_path(config_path)?;
+
+    if !ca_pem_path.exists() {
+        anyhow::bail!("CA certificate not found. Run `bulwark init` first.");
+    }
+
+    let platform = ca_trust::detect_platform();
+    eprintln!("Detected platform: {platform}");
+
+    if !skip_confirm {
+        eprintln!();
+        eprintln!("This will remove the Bulwark CA certificate from the system trust store.");
+        eprintln!("HTTPS MITM inspection will no longer work until the CA is reinstalled.");
+        eprint!("Continue? [y/N] ");
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading confirmation")?;
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let trust_cmd =
+        ca_trust::uninstall_command(&platform, &ca_pem_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!("  {}", trust_cmd.description);
+
+    match ca_trust::execute_trust_command(trust_cmd) {
+        Ok(()) => {
+            eprintln!();
+            eprintln!("CA certificate removed successfully.");
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Failed to remove CA certificate.\n\n{e}\n\n\
+                 Hint: try running with elevated privileges:\n  \
+                 sudo bulwark ca uninstall --yes"
+            );
+        }
+    }
+}
+
+/// Run the CA install flow non-interactively (used by `bulwark init`).
+/// Returns Ok(true) if installed, Ok(false) if skipped.
+pub fn try_install_from_init(ca_pem_path: &Path) -> Result<bool> {
+    let platform = ca_trust::detect_platform();
+
+    let trust_cmd = match ca_trust::install_command(&platform, ca_pem_path) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("  Cannot auto-install CA on this platform: {e}");
+            return Ok(false);
+        }
+    };
+
+    eprintln!("  {}", trust_cmd.description);
+
+    match ca_trust::execute_trust_command(trust_cmd) {
+        Ok(()) => {
+            eprintln!("  CA certificate installed system-wide.");
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("  Could not install CA automatically: {e}");
+            eprintln!("  You can install it manually later with: sudo bulwark ca install");
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
