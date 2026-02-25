@@ -7,6 +7,7 @@ use bulwark_audit::event::{
     AuditEvent, Channel, ErrorInfo, EventOutcome, EventType, PolicyInfo, RequestInfo, SessionInfo,
 };
 use bulwark_audit::logger::AuditLogger;
+use bulwark_audit::store::AuditStore;
 use bulwark_config::McpGatewayConfig;
 use bulwark_inspect::scanner::ContentScanner;
 use bulwark_inspect_http::HttpAnalyzerPipeline;
@@ -33,6 +34,7 @@ pub struct McpGateway {
     policy_engine: Option<Arc<PolicyEngine>>,
     vault: Option<Arc<parking_lot::Mutex<Vault>>>,
     audit_logger: Option<AuditLogger>,
+    audit_store: Option<Arc<parking_lot::Mutex<AuditStore>>>,
     content_scanner: Option<Arc<ContentScanner>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     cost_tracker: Option<Arc<CostTracker>>,
@@ -58,6 +60,7 @@ impl McpGateway {
             policy_engine: None,
             vault: None,
             audit_logger: None,
+            audit_store: None,
             content_scanner: None,
             rate_limiter: None,
             cost_tracker: None,
@@ -76,6 +79,7 @@ impl McpGateway {
             policy_engine: None,
             vault: None,
             audit_logger: None,
+            audit_store: None,
             content_scanner: None,
             rate_limiter: None,
             cost_tracker: None,
@@ -99,6 +103,12 @@ impl McpGateway {
     /// Attach an audit logger for event logging.
     pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
         self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Attach an audit store for builtin query tools.
+    pub fn with_audit_store(mut self, store: Arc<parking_lot::Mutex<AuditStore>>) -> Self {
+        self.audit_store = Some(store);
         self
     }
 
@@ -131,12 +141,14 @@ impl McpGateway {
         *self.session_token.lock() = Some(token);
     }
 
-    /// Validate the current session token against the vault.
+    /// Validate a session token against the vault.
+    /// If `vault_token` is `Some`, use it; otherwise fall back to the stored token.
     /// Returns the session if valid, or an error response if not.
     #[allow(clippy::result_large_err)]
     fn validate_session(
         &self,
         request_id: &crate::types::RequestId,
+        vault_token: Option<&str>,
     ) -> Result<Option<Session>, JsonRpcResponse> {
         let vault = match &self.vault {
             Some(v) => v,
@@ -145,7 +157,9 @@ impl McpGateway {
 
         let vault_guard = vault.lock();
 
-        let token = self.session_token.lock().clone();
+        let token = vault_token
+            .map(|t| t.to_string())
+            .or_else(|| self.session_token.lock().clone());
         let token = match token {
             Some(t) => t,
             None => {
@@ -176,13 +190,29 @@ impl McpGateway {
     }
 
     /// Handle a JSON-RPC message from the agent. Returns a response to send back.
+    ///
+    /// Uses the stored session token (set via [`set_session_token`]).
+    /// For per-request vault tokens (e.g. HTTP transport), use
+    /// [`handle_message_with_session_token`] instead.
     pub async fn handle_message(&self, msg: JsonRpcMessage) -> Option<JsonRpcMessage> {
+        self.handle_message_with_session_token(msg, None).await
+    }
+
+    /// Handle a JSON-RPC message with an optional per-request vault session token.
+    ///
+    /// If `vault_token` is `Some`, it overrides the stored session token for this
+    /// request only. This avoids races when multiple HTTP clients share a gateway.
+    pub async fn handle_message_with_session_token(
+        &self,
+        msg: JsonRpcMessage,
+        vault_token: Option<&str>,
+    ) -> Option<JsonRpcMessage> {
         match msg {
             JsonRpcMessage::Request(req) => {
                 let response = match req.method.as_str() {
                     "initialize" => self.handle_initialize(&req),
                     "tools/list" => self.handle_tools_list(&req).await,
-                    "tools/call" => self.handle_tools_call(&req).await,
+                    "tools/call" => self.handle_tools_call_with_token(&req, vault_token).await,
                     "ping" => self.handle_ping(&req),
                     _ => JsonRpcResponse::error(
                         req.id.clone(),
@@ -213,7 +243,8 @@ impl McpGateway {
         }
     }
 
-    /// Get the merged tool list from all upstream servers, with namespacing.
+    /// Get the merged tool list from all upstream servers, with namespacing,
+    /// plus builtin governance tools.
     pub async fn merged_tools(&self) -> Vec<Tool> {
         let mut result = Vec::new();
         for (server_name, upstream) in &self.upstreams {
@@ -231,6 +262,8 @@ impl McpGateway {
                 });
             }
         }
+        // Append builtin governance tools.
+        result.extend(crate::tools::builtin_tools());
         result
     }
 
@@ -277,7 +310,11 @@ impl McpGateway {
         JsonRpcResponse::success(req.id.clone(), serde_json::json!({ "tools": tools }))
     }
 
-    async fn handle_tools_call(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_tools_call_with_token(
+        &self,
+        req: &JsonRpcRequest,
+        vault_token: Option<&str>,
+    ) -> JsonRpcResponse {
         let params: ToolCallParams = match &req.params {
             Some(p) => match serde_json::from_value(p.clone()) {
                 Ok(params) => params,
@@ -322,7 +359,7 @@ impl McpGateway {
         );
 
         // Validate session if vault is configured.
-        let session = match self.validate_session(&req.id) {
+        let session = match self.validate_session(&req.id, vault_token) {
             Ok(s) => s,
             Err(err_resp) => return err_resp,
         };
@@ -336,6 +373,39 @@ impl McpGateway {
             environment: s.environment.clone(),
             agent_type: s.agent_type.clone(),
         });
+
+        // Dispatch builtin governance tools (bulwark__*) locally.
+        // Builtin tools bypass rate limiting and policy — they ARE the governance system.
+        if server_name == crate::tools::BUILTIN_PREFIX {
+            let builtin_ctx = crate::tools::BuiltinContext {
+                content_scanner: self.content_scanner.clone(),
+                audit_store: self.audit_store.clone(),
+                policy_engine: self.policy_engine.clone(),
+                vault: self.vault.clone(),
+            };
+            let tool_result = crate::tools::dispatch(&builtin_ctx, tool_name, params.arguments);
+            let result_value = serde_json::to_value(&tool_result).unwrap_or_default();
+
+            // Emit audit event for builtin tool call.
+            if let Some(ref logger) = self.audit_logger {
+                let mut builder =
+                    AuditEvent::builder(EventType::RequestProcessed, Channel::McpGateway)
+                        .outcome(EventOutcome::Success)
+                        .request(RequestInfo {
+                            tool: server_name.to_string(),
+                            action: tool_name.to_string(),
+                            resource: None,
+                            target: params.name.clone(),
+                        })
+                        .duration_us(start.elapsed().as_micros() as u64);
+                if let Some(ref si) = audit_session {
+                    builder = builder.session(si.clone());
+                }
+                logger.log(builder.build());
+            }
+
+            return JsonRpcResponse::success(req.id.clone(), result_value);
+        }
 
         // Check rate limit before policy evaluation (fail-fast).
         if let Some(limiter) = &self.rate_limiter {

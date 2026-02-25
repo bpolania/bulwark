@@ -10,6 +10,7 @@ pub mod gateway;
 pub mod governance;
 pub mod logging;
 pub mod server;
+pub mod tools;
 pub mod transport;
 pub mod types;
 pub mod upstream;
