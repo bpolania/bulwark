@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod context;
+pub mod error_response;
 pub mod forward;
 pub mod handler;
 pub mod logging;

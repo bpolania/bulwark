@@ -11,6 +11,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
 
 use crate::context::ProxyRequestContext;
+use crate::error_response;
 use crate::forward::{self, BoxBody};
 use crate::tls::TlsState;
 use crate::tunnel;
@@ -48,10 +49,7 @@ pub async fn handle_request(
 fn handle_internal(req: Request<Incoming>, start_time: Instant) -> Response<BoxBody> {
     match req.uri().path() {
         "/healthz" => health_check(start_time),
-        _ => forward::error_response(
-            hyper::StatusCode::BAD_REQUEST,
-            "not a proxy request (missing absolute URI)",
-        ),
+        _ => error_response::bad_request("not a proxy request (missing absolute URI)"),
     }
 }
 

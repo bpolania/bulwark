@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use uuid::Uuid;
@@ -18,6 +18,7 @@ use bulwark_audit::event::{
 };
 
 use crate::context::ProxyRequestContext;
+use crate::error_response;
 use crate::logging::RequestLog;
 
 /// Boxed body type used for proxy responses.
@@ -50,25 +51,16 @@ pub async fn forward_request(
             Some(t) => match vault_guard.validate_session(&t) {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
-                    return Ok(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid or expired session token",
-                    ));
+                    return Ok(error_response::session_invalid());
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "session validation error");
-                    return Ok(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Session validation error",
-                    ));
+                    return Ok(error_response::internal_error("Session validation error"));
                 }
             },
             None => {
                 if vault_guard.require_sessions() {
-                    return Ok(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Session token required. Set X-Bulwark-Session header.",
-                    ));
+                    return Ok(error_response::session_required());
                 }
                 None
             }
@@ -138,18 +130,10 @@ pub async fn forward_request(
                 }
                 logger.log(builder.build());
             }
-            let mut resp = error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                &format!("Rate limited: {}", denial.rule_name),
-            );
-            if let Some(retry_after) = denial.retry_after_secs {
-                if let Ok(val) =
-                    format!("{}", retry_after.ceil() as u64).parse::<hyper::header::HeaderValue>()
-                {
-                    resp.headers_mut().insert("retry-after", val);
-                }
-            }
-            return Ok(resp);
+            return Ok(error_response::rate_limited(
+                &denial.rule_name,
+                denial.retry_after_secs,
+            ));
         }
     }
 
@@ -186,9 +170,10 @@ pub async fn forward_request(
                     reason = %eval.reason,
                     "policy denied HTTP request"
                 );
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
-                    &format!("Policy denied: {}", eval.reason),
+                return Ok(error_response::policy_denied(
+                    &eval,
+                    &resolved_tool,
+                    &resolved_action,
                 ));
             }
         }
@@ -221,10 +206,7 @@ pub async fn forward_request(
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_e) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "failed to read request body",
-            ));
+            return Ok(error_response::bad_request("failed to read request body"));
         }
     };
     let request_bytes = body_bytes.len() as u64;
@@ -243,8 +225,7 @@ pub async fn forward_request(
                 findings = result.findings.len(),
                 "Content inspection blocked HTTP request"
             );
-            return Ok(error_response(
-                StatusCode::FORBIDDEN,
+            return Ok(error_response::content_blocked(
                 "Request blocked by content inspection",
             ));
         }
@@ -303,8 +284,7 @@ pub async fn forward_request(
                     findings = tier2_findings.len(),
                     "Tier 2 HTTP analyzer blocked request"
                 );
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
+                return Ok(error_response::content_blocked(
                     "Request blocked by HTTP callout analyzer",
                 ));
             }
@@ -365,10 +345,7 @@ pub async fn forward_request(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "failed to build outbound request");
-            return Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-            ));
+            return Ok(error_response::internal_error("internal error"));
         }
     };
 
@@ -414,8 +391,7 @@ pub async fn forward_request(
                             findings = inspection.findings.len(),
                             "blocking upstream response due to dangerous content"
                         );
-                        return Ok(error_response(
-                            StatusCode::BAD_GATEWAY,
+                        return Ok(error_response::response_blocked(
                             "Response blocked: upstream returned dangerous content",
                         ));
                     }
@@ -571,26 +547,11 @@ pub async fn forward_request(
                 logger.log(builder.build());
             }
 
-            Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream error: {e}"),
-            ))
+            Ok(error_response::upstream_error(&format!(
+                "upstream error: {e}"
+            )))
         }
     }
-}
-
-/// Build a simple error response with a JSON body.
-pub fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
-    let body = serde_json::json!({ "error": message }).to_string();
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(
-            Full::new(Bytes::from(body))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .expect("valid error response")
 }
 
 /// Returns `true` for headers that must not be forwarded by a proxy.
