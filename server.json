@@ -13,7 +13,6 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/bpolania/bulwark:0.2.0",
-      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       },
