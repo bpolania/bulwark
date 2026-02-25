@@ -187,11 +187,15 @@ async fn gateway_merged_tools_namespaces_correctly() {
     // by verifying the gateway's initialize and tools/list responses.
     let gateway = McpGateway::new_with_upstreams(HashMap::new());
 
-    // With no upstreams, merged_tools returns empty.
+    // With no upstreams, merged_tools returns only the builtin governance tools.
     let tools = gateway.merged_tools().await;
-    assert!(tools.is_empty());
+    assert_eq!(tools.len(), 7, "expected 7 builtin tools");
+    assert!(
+        tools.iter().all(|t| t.name.starts_with("bulwark__")),
+        "all builtin tools should be prefixed with bulwark__"
+    );
 
-    // Test that tools/list returns empty tools via handle_message.
+    // Test that tools/list returns the builtin tools via handle_message.
     let req = JsonRpcMessage::Request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: RequestId::Number(1),
@@ -201,7 +205,7 @@ async fn gateway_merged_tools_namespaces_correctly() {
     let resp = gateway.handle_message(req).await.unwrap();
     if let JsonRpcMessage::Response(r) = resp {
         let tools_arr = r.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert!(tools_arr.is_empty());
+        assert_eq!(tools_arr.len(), 7);
     } else {
         panic!("Expected response");
     }
@@ -568,6 +572,7 @@ async fn mcp_tool_call_produces_audit_event() {
             args: vec![script_path.to_str().unwrap().to_string()],
             env: Default::default(),
         }],
+        ..Default::default()
     };
 
     let engine = engine_with_rules(
@@ -700,7 +705,7 @@ rules:
     assert_eq!(meta["governance"]["verdict"], "allow");
     assert_eq!(meta["governance"]["matched_rule"], "allow-reads");
     assert_eq!(meta["governance"]["reason"], "read operations are safe");
-    assert_eq!(meta["governance"]["version"], "0.1.0");
+    assert_eq!(meta["governance"]["version"], "0.2.0");
     assert!(meta["governance"]["evaluation_time_us"].is_number());
 }
 
@@ -821,6 +826,7 @@ rules:
             args: vec![script_path.to_str().unwrap().to_string()],
             env: Default::default(),
         }],
+        ..Default::default()
     };
 
     let gateway = McpGateway::new(config)
@@ -953,6 +959,7 @@ rules:
             args: vec![script_path.to_str().unwrap().to_string()],
             env: Default::default(),
         }],
+        ..Default::default()
     };
 
     let gateway = McpGateway::new(config)
@@ -1042,6 +1049,7 @@ rules:
             args: vec![script_path.to_str().unwrap().to_string()],
             env: Default::default(),
         }],
+        ..Default::default()
     };
 
     let gateway = McpGateway::new(config)
@@ -1160,6 +1168,146 @@ rules:
     }
 }
 
+// ── Builtin governance tools integration tests ──────────────────────
+
+#[tokio::test]
+async fn builtin_scan_content_via_gateway() {
+    let scanner = Arc::new(bulwark_inspect::scanner::ContentScanner::builtin());
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_content_scanner(scanner);
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "bulwark__scan_content",
+            "arguments": {"text": "AKIAIOSFODNN7EXAMPLE"}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "builtin tool call should succeed: {:?}",
+            r.error
+        );
+        let result = r.result.unwrap();
+        // The result wraps a ToolCallResult with content array.
+        let content = result["content"].as_array().unwrap();
+        assert!(!content.is_empty());
+        let text = content[0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["finding_count"].as_u64().unwrap() > 0);
+        assert!(parsed["should_block"].as_bool().unwrap());
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn builtin_audit_verify_via_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bulwark_audit::store::AuditStore::open(&dir.path().join("audit.db")).unwrap();
+    let store = Arc::new(parking_lot::Mutex::new(store));
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_audit_store(store);
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "bulwark__audit_verify",
+            "arguments": {}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "audit verify should succeed: {:?}",
+            r.error
+        );
+        let result = r.result.unwrap();
+        let content = result["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["valid"].as_bool().unwrap());
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn builtin_policy_evaluate_via_gateway() {
+    let engine = engine_with_rules(
+        r#"
+rules:
+  - name: allow-reads
+    verdict: allow
+    reason: "reads are safe"
+    match:
+      actions: ["read_*"]
+"#,
+    );
+
+    let gateway = McpGateway::new_with_upstreams(HashMap::new()).with_policy_engine(engine);
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "bulwark__policy_evaluate",
+            "arguments": {"tool": "github", "action": "read_file"}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        assert!(
+            r.error.is_none(),
+            "policy evaluate should succeed: {:?}",
+            r.error
+        );
+        let result = r.result.unwrap();
+        let content = result["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["verdict"].as_str().unwrap(), "allow");
+    } else {
+        panic!("Expected response");
+    }
+}
+
+#[tokio::test]
+async fn builtin_unknown_tool_returns_error() {
+    let gateway = McpGateway::new_with_upstreams(HashMap::new());
+
+    let req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "bulwark__nonexistent_tool",
+            "arguments": {}
+        })),
+    });
+
+    let resp = gateway.handle_message(req).await.unwrap();
+    if let JsonRpcMessage::Response(r) = resp {
+        // The call succeeds at the JSON-RPC level but the tool result has is_error=true.
+        assert!(r.error.is_none(), "JSON-RPC level should succeed");
+        let result = r.result.unwrap();
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "unknown builtin tool should set isError=true");
+    } else {
+        panic!("Expected response");
+    }
+}
+
 // ── Phase 1I Verification: MCP adversarial tests ─────────────────────
 
 /// Malformed JSON-RPC messages (missing method, null id, garbage params) should
@@ -1244,4 +1392,341 @@ async fn adversarial_malformed_mcp_jsonrpc() {
     } else {
         panic!("Expected ping response");
     }
+}
+
+// ── HTTP transport integration tests ─────────────────────────────────
+
+use std::net::SocketAddr;
+
+/// Start a test HTTP server on a random port.
+/// Returns the bound address and a shutdown token.
+async fn start_test_http_server(
+    gateway: Arc<McpGateway>,
+    allowed_origins: Vec<String>,
+) -> (SocketAddr, CancellationToken) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        bulwark_mcp::server::run_http_server_with_listener(
+            gateway,
+            listener,
+            allowed_origins,
+            shutdown_clone,
+        )
+        .await
+        .unwrap();
+    });
+
+    // Give the server a moment to start accepting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, shutdown)
+}
+
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn http_post_initialize_returns_session_id() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let session_id = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .expect("should have Mcp-Session-Id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!session_id.is_empty());
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(body["result"]["serverInfo"]["name"], "bulwark");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_post_tools_list_returns_builtins() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    // First: initialize to get a session.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let session_id = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Then: tools/list with session.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &session_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 7, "expected 7 builtin tools");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_post_without_session_returns_error() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_delete_terminates_session() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    // Initialize to get a session.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let session_id = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // DELETE the session.
+    let resp = client
+        .delete(format!("http://{addr}/mcp"))
+        .header("Mcp-Session-Id", &session_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Subsequent POST with terminated session → 404.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &session_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_post_sse_format() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("Content-Type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    assert!(resp.headers().get("Mcp-Session-Id").is_some());
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.starts_with("event: message\ndata: "),
+        "expected SSE format, got: {body}"
+    );
+    assert!(body.ends_with("\n\n"));
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_origin_validation_rejects_bad_origin() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) =
+        start_test_http_server(gateway, vec!["https://good.com".to_string()]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Origin", "https://evil.com")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn http_notification_returns_202() {
+    let gateway = Arc::new(McpGateway::new_with_upstreams(HashMap::new()));
+    let (addr, shutdown) = start_test_http_server(gateway, vec![]).await;
+
+    let client = reqwest::Client::new();
+
+    // Initialize to get a session.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let session_id = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Send a notification — should return 202.
+    let resp = client
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &session_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 202);
+
+    shutdown.cancel();
 }

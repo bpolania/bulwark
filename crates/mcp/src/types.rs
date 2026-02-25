@@ -13,6 +13,12 @@ pub const POLICY_ESCALATED: i64 = -32001;
 pub const SESSION_REQUIRED: i64 = -32002;
 pub const CONTENT_BLOCKED: i64 = -32003;
 pub const RATE_LIMITED: i64 = -32004;
+pub const SESSION_TERMINATED: i64 = -32005;
+
+// ── HTTP transport constants ────────────────────────────────────────
+
+pub const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
+pub const BULWARK_SESSION_HEADER: &str = "X-Bulwark-Session";
 
 // ── JSON-RPC 2.0 primitives ─────────────────────────────────────────
 

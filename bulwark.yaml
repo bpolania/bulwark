@@ -53,7 +53,9 @@ cost_estimation:
   #   cost: 0.10
   #   monthly_budget: 100.0
 
-# mcp_gateway:
+mcp_gateway:
+  listen_address: "127.0.0.1:3000"
+  allowed_origins: []
 #   upstream_servers:
 #     - name: github
 #       command: "npx"
