@@ -216,7 +216,8 @@ bulwark ca export   # trust the CA in your HTTP client
 
 | Mode | Transport | Best For |
 |------|-----------|----------|
-| MCP Gateway | stdio/JSON-RPC | Claude Code, OpenClaw, any MCP client |
+| MCP Gateway (stdio) | stdio/JSON-RPC | Claude Code, OpenClaw, any MCP client |
+| MCP Gateway (HTTP) | Streamable HTTP | Remote agents, MCP registry, multi-agent |
 | HTTP Proxy | HTTP/HTTPS | Codex, curl, any HTTP client |
 
 ## Example Policy
@@ -254,7 +255,8 @@ See [examples/policies/](./examples/policies/) for complete policy sets (startup
 ```
 bulwark init <path>              # Scaffold a new project
 bulwark proxy start              # Start HTTP/HTTPS proxy
-bulwark mcp start                # Start MCP gateway
+bulwark mcp start                # Start MCP gateway (stdio)
+bulwark mcp serve                # Start MCP gateway (HTTP)
 bulwark doctor                   # Diagnose setup issues (9 checks)
 bulwark status                   # Health dashboard
 bulwark policy validate          # Validate policy files
@@ -286,7 +288,7 @@ bulwark completions <shell>      # Shell completions (bash/zsh/fish)
 git clone https://github.com/bpolania/bulwark.git
 cd bulwark
 cargo build --workspace
-cargo test --workspace          # 409 tests
+cargo test --workspace          # 487 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

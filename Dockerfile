@@ -7,6 +7,8 @@ RUN cargo build --release --package bulwark-cli
 
 FROM debian:bookworm-slim
 
+LABEL io.modelcontextprotocol.server.name="io.github.bpolania/bulwark"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -17,7 +19,7 @@ RUN useradd --create-home --shell /bin/bash bulwark
 USER bulwark
 WORKDIR /home/bulwark
 
-EXPOSE 8080
+EXPOSE 8080 3000
 
 ENTRYPOINT ["bulwark"]
 CMD ["proxy", "start"]

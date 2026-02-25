@@ -9,7 +9,7 @@ use bulwark_policy::verdict::PolicyEvaluation;
 pub fn governance_metadata(evaluation: &PolicyEvaluation) -> serde_json::Value {
     serde_json::json!({
         "governance": {
-            "version": "0.1.0",
+            "version": "0.2.0",
             "verdict": serde_json::to_value(&evaluation.verdict).unwrap_or_default(),
             "matched_rule": evaluation.matched_rule,
             "matched_policy": evaluation.matched_policy,
@@ -24,7 +24,7 @@ pub fn governance_metadata(evaluation: &PolicyEvaluation) -> serde_json::Value {
 pub fn governance_metadata_stub() -> serde_json::Value {
     serde_json::json!({
         "governance": {
-            "version": "0.1.0",
+            "version": "0.2.0",
             "verdict": "allow",
             "policy_version": null,
             "session_id": null,
