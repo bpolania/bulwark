@@ -15,6 +15,7 @@ use bulwark_config::ProxyConfig;
 use bulwark_inspect::scanner::ContentScanner;
 use bulwark_inspect_http::HttpAnalyzerPipeline;
 use bulwark_policy::engine::PolicyEngine;
+use bulwark_policy::glob::GlobPattern;
 use bulwark_ratelimit::cost::CostTracker;
 use bulwark_ratelimit::limiter::RateLimiter;
 use bulwark_vault::store::Vault;
@@ -95,6 +96,12 @@ impl ProxyServer {
     /// Attach an HTTP analyzer pipeline for Tier 2 content inspection.
     pub fn with_http_analyzers(mut self, pipeline: Arc<HttpAnalyzerPipeline>) -> Self {
         self.ctx.http_analyzers = Some(pipeline);
+        self
+    }
+
+    /// Attach TLS passthrough patterns (hosts that bypass TLS MITM).
+    pub fn with_tls_passthrough(mut self, patterns: Vec<GlobPattern>) -> Self {
+        self.ctx.tls_passthrough = Some(Arc::new(patterns));
         self
     }
 

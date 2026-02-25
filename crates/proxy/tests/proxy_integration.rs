@@ -34,6 +34,7 @@ async fn start_test_proxy(ca_dir: &str) -> (SocketAddr, CancellationToken, Arc<P
             ca_dir: ca_dir.to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(ProxyServer::new(config).await.expect("proxy server"));
@@ -315,6 +316,7 @@ async fn start_test_proxy_with_policy(
             ca_dir: ca_dir.to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -380,12 +382,10 @@ rules:
 
     assert_eq!(resp.status(), 403);
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Policy denied"),
-        "expected policy denial in body, got: {body}",
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "policy_denied",
+        "expected policy_denied error code, got: {body}",
     );
 
     token.cancel();
@@ -445,6 +445,7 @@ async fn start_test_proxy_with_vault(
             ca_dir: ca_dir.to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -805,6 +806,7 @@ async fn http_request_produces_audit_event() {
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -876,6 +878,7 @@ async fn start_test_proxy_with_scanner(
             ca_dir: ca_dir.to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     // Need an allow-all policy so the request reaches content inspection.
@@ -943,12 +946,10 @@ async fn http_request_blocked_by_content_inspection() {
     );
 
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("content inspection"),
-        "error should mention content inspection, got: {body}",
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "content_blocked",
+        "error should be content_blocked, got: {body}",
     );
 
     // Verify clean requests still go through.
@@ -1245,12 +1246,10 @@ async fn proxy_block_still_works_after_redaction_wiring() {
     );
 
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("content inspection"),
-        "error should mention content inspection, got: {body}",
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "content_blocked",
+        "error should be content_blocked, got: {body}",
     );
 
     token.cancel();
@@ -1323,12 +1322,10 @@ async fn proxy_blocks_dangerous_response() {
     );
 
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("upstream returned dangerous content"),
-        "error should mention dangerous content, got: {body}",
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "response_blocked",
+        "error should be response_blocked, got: {body}",
     );
 
     token.cancel();
@@ -1576,6 +1573,7 @@ async fn start_test_proxy_with_toolmap(
             ca_dir: ca_dir.to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -1653,12 +1651,10 @@ rules:
     );
 
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Policy denied"),
-        "error should mention policy denial, got: {body}",
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "policy_denied",
+        "error should be policy_denied, got: {body}",
     );
 
     token.cancel();
@@ -1701,6 +1697,7 @@ rules:
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -1818,6 +1815,7 @@ rules:
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -2487,6 +2485,7 @@ rules:
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -2848,6 +2847,7 @@ rules:
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     // No content scanner — we are testing audit log injection, not content inspection.
@@ -2948,6 +2948,7 @@ rules:
             ca_dir: ca_dir.to_str().unwrap().to_string(),
         },
         tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
     };
 
     let server = Arc::new(
@@ -3013,6 +3014,200 @@ rules:
         "at least some requests should be rate limited, but got 0 rate-limited \
          (successes={successes})"
     );
+
+    token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// TLS Passthrough tests
+// ---------------------------------------------------------------------------
+
+/// Verify that GlobPattern matching works correctly for passthrough host patterns.
+#[tokio::test]
+async fn test_tls_passthrough_pattern_matching() {
+    use bulwark_policy::glob::GlobPattern;
+
+    let patterns: Vec<GlobPattern> = vec![
+        GlobPattern::compile("*.pinned-service.com").unwrap(),
+        GlobPattern::compile("vault.internal:8200").unwrap(),
+        GlobPattern::compile("exact-host.example.org").unwrap(),
+    ];
+
+    // Wildcard matching.
+    assert!(patterns.iter().any(|p| p.matches("api.pinned-service.com")));
+    assert!(
+        patterns
+            .iter()
+            .any(|p| p.matches("deep.sub.pinned-service.com"))
+    );
+
+    // Exact matching with port.
+    assert!(patterns.iter().any(|p| p.matches("vault.internal:8200")));
+
+    // Exact host matching.
+    assert!(patterns.iter().any(|p| p.matches("exact-host.example.org")));
+
+    // Non-matching hosts.
+    assert!(!patterns.iter().any(|p| p.matches("other-service.com")));
+    assert!(!patterns.iter().any(|p| p.matches("vault.internal:9200")));
+    assert!(!patterns.iter().any(|p| p.matches("wrong-host.example.org")));
+}
+
+/// Verify that the passthrough path sends a 200 and tunnels bytes directly
+/// (no TLS MITM). We test by CONNECT-ing to a matched host and verifying
+/// the proxy returns 200 and pipes TCP bytes through.
+#[tokio::test]
+async fn test_tls_passthrough_tunnels_tcp() {
+    use bulwark_policy::glob::GlobPattern;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Start a simple TCP echo server (non-TLS).
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    let echo_addr = echo_listener.local_addr().expect("echo addr");
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match echo_listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    // Start proxy with passthrough pattern matching the echo server's host:port.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let ca_dir = tmp.path().to_str().expect("ca dir");
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_string(),
+        },
+        tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
+    };
+
+    let passthrough_patterns =
+        vec![GlobPattern::compile(&format!("127.0.0.1:{}", echo_addr.port())).unwrap()];
+
+    let server = Arc::new(
+        ProxyServer::new(config)
+            .await
+            .expect("proxy server")
+            .with_tls_passthrough(passthrough_patterns),
+    );
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        server_clone
+            .run_with_listener(listener)
+            .await
+            .expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send a CONNECT request to the proxy for the echo server address.
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+
+    let connect_req = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        echo_addr.port(),
+        echo_addr.port()
+    );
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .expect("send CONNECT");
+
+    // Read the 200 response.
+    let mut resp_buf = vec![0u8; 1024];
+    let n = stream.read(&mut resp_buf).await.expect("read response");
+    let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+    assert!(
+        resp_str.contains("200"),
+        "expected 200 response, got: {resp_str}"
+    );
+
+    // Now the tunnel is established. Send raw bytes and expect them echoed.
+    let test_data = b"hello passthrough!";
+    stream
+        .write_all(test_data)
+        .await
+        .expect("write through tunnel");
+
+    let mut echo_buf = vec![0u8; 1024];
+    let n = stream.read(&mut echo_buf).await.expect("read echo");
+    assert_eq!(&echo_buf[..n], test_data, "expected echoed data");
+
+    token.cancel();
+}
+
+/// Verify backward compatibility — proxy without passthrough patterns works normally.
+#[tokio::test]
+async fn test_no_passthrough_backward_compatible() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let ca_dir = tmp.path().to_str().expect("ca dir");
+
+    let echo_addr = start_echo_server().await;
+
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        tls: bulwark_config::TlsConfig {
+            ca_dir: ca_dir.to_string(),
+        },
+        tool_mappings: Vec::new(),
+        tls_passthrough: Vec::new(),
+    };
+
+    // No passthrough patterns at all (None).
+    let server = Arc::new(ProxyServer::new(config).await.expect("proxy server"));
+    let token = server.shutdown_token();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+
+    let server_clone = Arc::clone(&server);
+    tokio::spawn(async move {
+        server_clone
+            .run_with_listener(listener)
+            .await
+            .expect("proxy run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // HTTP request through proxy should still work normally.
+    let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).expect("proxy");
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .expect("client");
+
+    let resp = client
+        .get(format!("http://{echo_addr}/hello"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["path"], "/hello");
 
     token.cancel();
 }

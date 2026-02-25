@@ -9,6 +9,7 @@ use bulwark_audit::logger::AuditLogger;
 use bulwark_inspect::scanner::ContentScanner;
 use bulwark_inspect_http::HttpAnalyzerPipeline;
 use bulwark_policy::engine::PolicyEngine;
+use bulwark_policy::glob::GlobPattern;
 use bulwark_ratelimit::cost::CostTracker;
 use bulwark_ratelimit::limiter::RateLimiter;
 use bulwark_vault::store::Vault;
@@ -27,6 +28,8 @@ pub struct ProxyRequestContext {
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub cost_tracker: Option<Arc<CostTracker>>,
     pub http_analyzers: Option<Arc<HttpAnalyzerPipeline>>,
+    /// Compiled host patterns that bypass TLS MITM (plain TCP passthrough).
+    pub tls_passthrough: Option<Arc<Vec<GlobPattern>>>,
 }
 
 impl ProxyRequestContext {
@@ -40,6 +43,7 @@ impl ProxyRequestContext {
             rate_limiter: None,
             cost_tracker: None,
             http_analyzers: None,
+            tls_passthrough: None,
         }
     }
 }

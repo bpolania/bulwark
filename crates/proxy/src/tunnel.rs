@@ -30,7 +30,8 @@ use bulwark_audit::event::{
 };
 
 use crate::context::ProxyRequestContext;
-use crate::forward::{BoxBody, error_response};
+use crate::error_response;
+use crate::forward::BoxBody;
 use crate::logging::RequestLog;
 use crate::tls::TlsState;
 
@@ -46,15 +47,97 @@ pub async fn handle_connect(
     let target_authority = match req.uri().authority() {
         Some(auth) => auth.to_string(),
         None => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "CONNECT missing authority",
-            ));
+            return Ok(error_response::bad_request("CONNECT missing authority"));
         }
     };
 
     let target_host = req.uri().host().unwrap_or("unknown").to_string();
     let target_port = req.uri().port_u16().unwrap_or(443);
+
+    // Check if this host matches a TLS passthrough pattern.
+    if let Some(ref patterns) = ctx.tls_passthrough {
+        let matches = patterns
+            .iter()
+            .any(|p| p.matches(&target_authority) || p.matches(&target_host));
+        if matches {
+            tracing::info!(
+                host = %target_host,
+                authority = %target_authority,
+                "TLS passthrough — bypassing MITM"
+            );
+
+            // Emit audit event for passthrough connection.
+            if let Some(ref logger) = ctx.audit_logger {
+                let builder = AuditEvent::builder(EventType::TlsPassthrough, Channel::HttpsProxy)
+                    .outcome(EventOutcome::Success)
+                    .request(RequestInfo {
+                        tool: target_host.clone(),
+                        action: format!("CONNECT {}", target_authority),
+                        resource: None,
+                        target: target_authority.clone(),
+                    });
+                logger.log(builder.build());
+            }
+
+            // Spawn a task that upgrades and pipes bytes.
+            let target_host_pt = target_host.clone();
+            tokio::spawn(async move {
+                let upgraded = match hyper::upgrade::on(req).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::error!(error = %e, "passthrough upgrade failed");
+                        return;
+                    }
+                };
+
+                let upstream =
+                    match tokio::net::TcpStream::connect((target_host_pt.as_str(), target_port))
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                host = %target_host_pt,
+                                error = %e,
+                                "passthrough upstream connect failed"
+                            );
+                            return;
+                        }
+                    };
+
+                let mut client = TokioIo::new(upgraded);
+                let mut server = upstream;
+
+                match tokio::io::copy_bidirectional(&mut client, &mut server).await {
+                    Ok((c2s, s2c)) => {
+                        tracing::debug!(
+                            host = %target_host_pt,
+                            client_to_server = c2s,
+                            server_to_client = s2c,
+                            "passthrough tunnel closed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            host = %target_host_pt,
+                            error = %e,
+                            "passthrough tunnel error"
+                        );
+                    }
+                }
+            });
+
+            // Return 200 to establish the tunnel.
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .expect("valid CONNECT passthrough response"));
+        }
+    }
 
     // Evaluate policy on the CONNECT target if engine is configured.
     if let Some(engine) = &ctx.policy_engine {
@@ -73,9 +156,10 @@ pub async fn handle_connect(
                     reason = %eval.reason,
                     "policy denied CONNECT"
                 );
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
-                    &format!("Policy denied: {}", eval.reason),
+                return Ok(error_response::policy_denied(
+                    &eval,
+                    &target_host,
+                    &format!("CONNECT {}", target_authority),
                 ));
             }
         }
@@ -219,25 +303,16 @@ async fn forward_tls_request(
             Some(t) => match vault_guard.validate_session(&t) {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
-                    return Ok(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid or expired session token",
-                    ));
+                    return Ok(error_response::session_invalid());
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "session validation error");
-                    return Ok(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Session validation error",
-                    ));
+                    return Ok(error_response::internal_error("Session validation error"));
                 }
             },
             None => {
                 if vault_guard.require_sessions() {
-                    return Ok(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Session token required. Set X-Bulwark-Session header.",
-                    ));
+                    return Ok(error_response::session_required());
                 }
                 None
             }
@@ -296,18 +371,10 @@ async fn forward_tls_request(
                 }
                 logger.log(builder.build());
             }
-            let mut resp = error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                &format!("Rate limited: {}", denial.rule_name),
-            );
-            if let Some(retry_after) = denial.retry_after_secs {
-                if let Ok(val) =
-                    format!("{}", retry_after.ceil() as u64).parse::<hyper::header::HeaderValue>()
-                {
-                    resp.headers_mut().insert("retry-after", val);
-                }
-            }
-            return Ok(resp);
+            return Ok(error_response::rate_limited(
+                &denial.rule_name,
+                denial.retry_after_secs,
+            ));
         }
     }
 
@@ -344,9 +411,10 @@ async fn forward_tls_request(
                     reason = %eval.reason,
                     "policy denied HTTPS request"
                 );
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
-                    &format!("Policy denied: {}", eval.reason),
+                return Ok(error_response::policy_denied(
+                    &eval,
+                    &resolved_tool,
+                    &resolved_action,
                 ));
             }
         }
@@ -372,10 +440,7 @@ async fn forward_tls_request(
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_e) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "failed to read request body",
-            ));
+            return Ok(error_response::bad_request("failed to read request body"));
         }
     };
     let request_bytes = body_bytes.len() as u64;
@@ -394,8 +459,7 @@ async fn forward_tls_request(
                 findings = result.findings.len(),
                 "Content inspection blocked HTTPS request"
             );
-            return Ok(error_response(
-                StatusCode::FORBIDDEN,
+            return Ok(error_response::content_blocked(
                 "Request blocked by content inspection",
             ));
         }
@@ -447,10 +511,9 @@ async fn forward_tls_request(
                 tls: true,
                 error: Some(e.to_string()),
             });
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("connect failed: {e}"),
-            ));
+            return Ok(error_response::upstream_error(&format!(
+                "connect failed: {e}"
+            )));
         }
     };
 
@@ -470,10 +533,9 @@ async fn forward_tls_request(
                 tls: true,
                 error: Some(e.to_string()),
             });
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("invalid server name: {e}"),
-            ));
+            return Ok(error_response::upstream_error(&format!(
+                "invalid server name: {e}"
+            )));
         }
     };
 
@@ -493,10 +555,9 @@ async fn forward_tls_request(
                 tls: true,
                 error: Some(e.to_string()),
             });
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("TLS connect failed: {e}"),
-            ));
+            return Ok(error_response::upstream_error(&format!(
+                "TLS connect failed: {e}"
+            )));
         }
     };
 
@@ -571,10 +632,7 @@ async fn forward_tls_request(
                 tls: true,
                 error: Some(e.to_string()),
             });
-            return Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-            ));
+            return Ok(error_response::internal_error("internal error"));
         }
     };
 
@@ -611,8 +669,7 @@ async fn forward_tls_request(
                             findings = inspection.findings.len(),
                             "blocking upstream HTTPS response due to dangerous content"
                         );
-                        return Ok(error_response(
-                            StatusCode::BAD_GATEWAY,
+                        return Ok(error_response::response_blocked(
                             "Response blocked: upstream returned dangerous content",
                         ));
                     }
@@ -764,10 +821,9 @@ async fn forward_tls_request(
                 logger.log(builder.build());
             }
 
-            Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream error: {e}"),
-            ))
+            Ok(error_response::upstream_error(&format!(
+                "upstream error: {e}"
+            )))
         }
     }
 }

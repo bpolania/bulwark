@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use bulwark_audit::logger::AuditLogger;
 use bulwark_config::{LogFormat, load_config};
 use bulwark_policy::engine::PolicyEngine;
+use bulwark_policy::glob::GlobPattern;
 use bulwark_proxy::server::ProxyServer;
 use bulwark_vault::store::Vault;
 use tracing_subscriber::EnvFilter;
@@ -55,6 +56,7 @@ pub fn start(
     let vault_config = config.vault.clone();
     let audit_config = config.audit.clone();
     let inspect_config = config.inspect.clone();
+    let tls_passthrough_patterns = config.proxy.tls_passthrough.clone();
 
     rt.block_on(async {
         let mut server = ProxyServer::new(config.proxy)
@@ -183,6 +185,26 @@ pub fn start(
             }
         } else {
             tracing::info!("content inspection disabled");
+        }
+
+        // Compile TLS passthrough patterns.
+        if !tls_passthrough_patterns.is_empty() {
+            let mut compiled = Vec::with_capacity(tls_passthrough_patterns.len());
+            for pattern in &tls_passthrough_patterns {
+                match GlobPattern::compile(pattern) {
+                    Ok(g) => compiled.push(g),
+                    Err(e) => {
+                        tracing::warn!(pattern = %pattern, error = %e, "invalid tls_passthrough pattern, skipping");
+                    }
+                }
+            }
+            if !compiled.is_empty() {
+                tracing::info!(
+                    patterns = compiled.len(),
+                    "TLS passthrough enabled"
+                );
+                server = server.with_tls_passthrough(compiled);
+            }
         }
 
         let shutdown_token = server.shutdown_token();
