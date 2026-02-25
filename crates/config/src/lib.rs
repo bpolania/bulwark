@@ -31,6 +31,8 @@ pub struct BulwarkConfig {
     pub rate_limit: RateLimitConfig,
     /// Cost estimation settings.
     pub cost_estimation: CostConfig,
+    /// Authentication settings (OIDC).
+    pub auth: AuthConfig,
 }
 
 /// Configuration for the proxy listener.
@@ -43,6 +45,8 @@ pub struct ProxyConfig {
     pub tls: TlsConfig,
     /// URL-to-tool mappings for semantic policy evaluation.
     pub tool_mappings: Vec<ToolMapping>,
+    /// Host patterns that bypass TLS MITM (plain TCP passthrough).
+    pub tls_passthrough: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -51,6 +55,7 @@ impl Default for ProxyConfig {
             listen_address: "127.0.0.1:8080".to_string(),
             tls: TlsConfig::default(),
             tool_mappings: Vec::new(),
+            tls_passthrough: Vec::new(),
         }
     }
 }
@@ -166,6 +171,13 @@ impl Default for LoggingConfig {
 pub struct McpGatewayConfig {
     /// Upstream MCP tool servers.
     pub upstream_servers: Vec<UpstreamServerConfig>,
+    /// HTTP listen address for Streamable HTTP transport (e.g. `"127.0.0.1:3000"`).
+    /// `None` means HTTP transport is disabled.
+    #[serde(default)]
+    pub listen_address: Option<String>,
+    /// Allowed origins for DNS rebinding protection. Empty = allow all.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 /// Configuration for a single upstream MCP tool server.
@@ -331,6 +343,127 @@ pub struct CostRule {
     pub monthly_budget: Option<f64>,
 }
 
+/// Authentication configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// OIDC provider configuration.
+    pub oidc: Option<AuthOidcConfig>,
+    /// Auth management server settings.
+    pub server: AuthServerConfig,
+}
+
+/// Auth management server configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthServerConfig {
+    /// Whether the auth management server is enabled.
+    pub enabled: bool,
+    /// Address for the auth management server (e.g. `"127.0.0.1:9082"`).
+    pub listen_address: String,
+}
+
+impl Default for AuthServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:9082".to_string(),
+        }
+    }
+}
+
+/// OIDC provider configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthOidcConfig {
+    /// Whether OIDC authentication is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OIDC issuer URL (e.g. `"https://acme.okta.com/oauth2/default"`).
+    pub issuer_url: String,
+    /// OAuth client ID.
+    pub client_id: String,
+    /// Where to read the client secret from.
+    #[serde(default = "default_secret_source")]
+    pub client_secret_source: SecretSource,
+    /// Path to client secret file (when `client_secret_source` is `file`).
+    pub client_secret_path: Option<String>,
+    /// Environment variable name (when `client_secret_source` is `env`).
+    #[serde(default = "default_secret_env_var")]
+    pub client_secret_env: String,
+    /// OAuth redirect URI for the authorization code flow.
+    pub redirect_uri: Option<String>,
+    /// OAuth scopes to request.
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<String>,
+    /// Claim name containing group memberships.
+    #[serde(default = "default_group_claim")]
+    pub group_claim: String,
+    /// Maps IdP group names to Bulwark session fields.
+    #[serde(default)]
+    pub group_mapping: HashMap<String, GroupMappingEntry>,
+    /// Default session TTL in seconds.
+    #[serde(default = "default_session_ttl")]
+    pub default_session_ttl: u64,
+    /// Service account settings.
+    #[serde(default)]
+    pub service_accounts: ServiceAccountConfig,
+}
+
+/// Where to read the OAuth client secret from.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretSource {
+    /// Read from an environment variable.
+    #[default]
+    Env,
+    /// Read from a file.
+    File,
+    /// Read from Bulwark's credential vault (not yet implemented).
+    Vault,
+}
+
+/// Service account configuration for client credentials flow.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ServiceAccountConfig {
+    /// Whether service account authentication is enabled.
+    pub enabled: bool,
+}
+
+/// Maps an IdP group name to Bulwark session fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupMappingEntry {
+    /// Team name to assign.
+    pub team: Option<String>,
+    /// Environment to assign.
+    pub environment: Option<String>,
+    /// Agent type to assign.
+    pub agent_type: Option<String>,
+    /// Additional labels.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+fn default_secret_source() -> SecretSource {
+    SecretSource::Env
+}
+
+fn default_secret_env_var() -> String {
+    "BULWARK_OIDC_CLIENT_SECRET".to_string()
+}
+
+fn default_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "groups".into()]
+}
+
+fn default_group_claim() -> String {
+    "groups".to_string()
+}
+
+fn default_session_ttl() -> u64 {
+    3600
+}
+
 /// Resolve `${VAR_NAME}` references in a string to environment variables.
 pub fn resolve_env_vars(value: &str) -> String {
     if let Some(var_name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
@@ -481,5 +614,238 @@ cost_estimation:
         // invalid
         let result: Result<ActionFrom, _> = serde_yaml::from_str("\"bogus\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tls_passthrough_config() {
+        let yaml = r#"
+proxy:
+  tls_passthrough:
+    - "*.pinned-service.com"
+    - "vault.internal:8200"
+    - "mtls.example.org"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.proxy.tls_passthrough.len(), 3);
+        assert_eq!(cfg.proxy.tls_passthrough[0], "*.pinned-service.com");
+        assert_eq!(cfg.proxy.tls_passthrough[1], "vault.internal:8200");
+        assert_eq!(cfg.proxy.tls_passthrough[2], "mtls.example.org");
+    }
+
+    #[test]
+    fn test_mcp_http_config() {
+        let yaml = r#"
+mcp_gateway:
+  listen_address: "0.0.0.0:4000"
+  allowed_origins:
+    - "https://example.com"
+    - "https://app.example.com"
+  upstream_servers: []
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.mcp_gateway.listen_address.as_deref(),
+            Some("0.0.0.0:4000")
+        );
+        assert_eq!(cfg.mcp_gateway.allowed_origins.len(), 2);
+        assert_eq!(cfg.mcp_gateway.allowed_origins[0], "https://example.com");
+    }
+
+    #[test]
+    fn test_mcp_http_config_defaults() {
+        let yaml = r#"
+mcp_gateway:
+  upstream_servers: []
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.mcp_gateway.listen_address.is_none());
+        assert!(cfg.mcp_gateway.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn test_tls_passthrough_defaults_to_empty() {
+        let yaml = r#"
+proxy:
+  listen_address: "0.0.0.0:9090"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.proxy.tls_passthrough.is_empty());
+    }
+
+    #[test]
+    fn test_auth_oidc_full_config() {
+        let yaml = r#"
+auth:
+  oidc:
+    enabled: true
+    issuer_url: "https://acme.okta.com/oauth2/default"
+    client_id: "0oa1234567890"
+    client_secret_source: env
+    client_secret_env: "MY_SECRET"
+    redirect_uri: "http://localhost:9090/callback"
+    scopes: ["openid", "profile", "groups", "email"]
+    group_claim: "groups"
+    group_mapping:
+      "okta-engineering":
+        team: "engineering"
+      "okta-platform":
+        team: "platform"
+        environment: "production"
+    default_session_ttl: 7200
+    service_accounts:
+      enabled: true
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        let oidc = cfg.auth.oidc.expect("oidc should be present");
+        assert!(oidc.enabled);
+        assert_eq!(oidc.issuer_url, "https://acme.okta.com/oauth2/default");
+        assert_eq!(oidc.client_id, "0oa1234567890");
+        assert_eq!(oidc.client_secret_env, "MY_SECRET");
+        assert_eq!(
+            oidc.redirect_uri.as_deref(),
+            Some("http://localhost:9090/callback")
+        );
+        assert_eq!(oidc.scopes.len(), 4);
+        assert_eq!(oidc.group_claim, "groups");
+        assert_eq!(oidc.group_mapping.len(), 2);
+        assert_eq!(
+            oidc.group_mapping["okta-engineering"].team.as_deref(),
+            Some("engineering")
+        );
+        assert_eq!(
+            oidc.group_mapping["okta-platform"].environment.as_deref(),
+            Some("production")
+        );
+        assert_eq!(oidc.default_session_ttl, 7200);
+        assert!(oidc.service_accounts.enabled);
+    }
+
+    #[test]
+    fn test_auth_oidc_minimal_config() {
+        let yaml = r#"
+auth:
+  oidc:
+    issuer_url: "https://login.microsoftonline.com/tenant/v2.0"
+    client_id: "abc123"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        let oidc = cfg.auth.oidc.expect("oidc should be present");
+        assert!(!oidc.enabled);
+        assert_eq!(
+            oidc.issuer_url,
+            "https://login.microsoftonline.com/tenant/v2.0"
+        );
+        assert_eq!(oidc.client_id, "abc123");
+        assert_eq!(oidc.client_secret_env, "BULWARK_OIDC_CLIENT_SECRET");
+        assert_eq!(oidc.scopes, vec!["openid", "profile", "groups"]);
+        assert_eq!(oidc.group_claim, "groups");
+        assert!(oidc.group_mapping.is_empty());
+        assert_eq!(oidc.default_session_ttl, 3600);
+        assert!(!oidc.service_accounts.enabled);
+    }
+
+    #[test]
+    fn test_auth_missing_section_backward_compatible() {
+        let yaml = r#"
+proxy:
+  listen_address: "0.0.0.0:8080"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.auth.oidc.is_none());
+    }
+
+    #[test]
+    fn test_secret_source_variants() {
+        let env: SecretSource = serde_yaml::from_str("\"env\"").unwrap();
+        assert!(matches!(env, SecretSource::Env));
+
+        let file: SecretSource = serde_yaml::from_str("\"file\"").unwrap();
+        assert!(matches!(file, SecretSource::File));
+
+        let vault: SecretSource = serde_yaml::from_str("\"vault\"").unwrap();
+        assert!(matches!(vault, SecretSource::Vault));
+    }
+
+    #[test]
+    fn test_group_mapping_deserialization() {
+        let yaml = r#"
+auth:
+  oidc:
+    issuer_url: "https://example.com"
+    client_id: "test"
+    group_mapping:
+      "admin-group":
+        team: "platform"
+        environment: "production"
+        agent_type: "claude-code"
+        labels:
+          tier: "admin"
+      "dev-group":
+        team: "engineering"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        let oidc = cfg.auth.oidc.unwrap();
+        assert_eq!(oidc.group_mapping.len(), 2);
+
+        let admin = &oidc.group_mapping["admin-group"];
+        assert_eq!(admin.team.as_deref(), Some("platform"));
+        assert_eq!(admin.environment.as_deref(), Some("production"));
+        assert_eq!(admin.agent_type.as_deref(), Some("claude-code"));
+        assert_eq!(admin.labels.get("tier").map(|s| s.as_str()), Some("admin"));
+
+        let dev = &oidc.group_mapping["dev-group"];
+        assert_eq!(dev.team.as_deref(), Some("engineering"));
+        assert!(dev.environment.is_none());
+        assert!(dev.agent_type.is_none());
+        assert!(dev.labels.is_empty());
+    }
+
+    #[test]
+    fn test_auth_server_config_defaults() {
+        let cfg = AuthServerConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.listen_address, "127.0.0.1:9082");
+    }
+
+    #[test]
+    fn test_auth_server_config_full() {
+        let yaml = r#"
+auth:
+  server:
+    enabled: true
+    listen_address: "0.0.0.0:9999"
+  oidc:
+    issuer_url: "https://example.com"
+    client_id: "test"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.auth.server.enabled);
+        assert_eq!(cfg.auth.server.listen_address, "0.0.0.0:9999");
+    }
+
+    #[test]
+    fn test_auth_config_without_server_backward_compat() {
+        let yaml = r#"
+auth:
+  oidc:
+    issuer_url: "https://example.com"
+    client_id: "test"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.auth.server.enabled);
+        assert_eq!(cfg.auth.server.listen_address, "127.0.0.1:9082");
+    }
+
+    #[test]
+    fn test_default_session_ttl_defaults_to_3600() {
+        let yaml = r#"
+auth:
+  oidc:
+    issuer_url: "https://example.com"
+    client_id: "test"
+"#;
+        let cfg: BulwarkConfig = serde_yaml::from_str(yaml).unwrap();
+        let oidc = cfg.auth.oidc.unwrap();
+        assert_eq!(oidc.default_session_ttl, 3600);
     }
 }

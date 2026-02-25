@@ -20,6 +20,7 @@ bulwark-vault.workspace = true
 bulwark-audit.workspace = true
 bulwark-inspect.workspace = true
 bulwark-inspect-http.workspace = true
+bulwark-auth.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 clap.workspace = true
@@ -36,6 +37,12 @@ serde_json.workspace = true
 clap_complete.workspace = true
 colored.workspace = true
 serde.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+open = "5"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

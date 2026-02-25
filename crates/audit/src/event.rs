@@ -58,6 +58,10 @@ pub enum EventType {
     RateLimited,
     /// A request was denied because a cost budget was exceeded.
     BudgetExceeded,
+    /// A CONNECT tunnel bypassed TLS MITM (passthrough mode).
+    TlsPassthrough,
+    /// A session was created via OIDC authentication.
+    OidcSessionCreated,
     /// An error occurred during processing.
     Error,
 }
@@ -340,6 +344,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&EventType::SessionValidationFailed).unwrap(),
             "\"session_validation_failed\""
+        );
+    }
+
+    #[test]
+    fn oidc_session_created_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EventType::OidcSessionCreated).unwrap(),
+            "\"oidc_session_created\""
         );
     }
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
+mod ca_trust;
 mod commands;
 
 /// Governance layer for AI agents.
@@ -74,6 +75,11 @@ enum Commands {
         #[command(subcommand)]
         action: InspectAction,
     },
+    /// OIDC authentication management.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Diagnose common setup issues.
     Doctor {
         /// Output as JSON.
@@ -100,12 +106,30 @@ enum CaAction {
     Export,
     /// Print the absolute path to the CA certificate PEM file.
     Path,
+    /// Install the CA certificate as a trusted root in the system store.
+    Install {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove the CA certificate from the system trust store.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum McpAction {
     /// Start the MCP gateway (stdio mode).
     Start,
+    /// Start the MCP gateway over HTTP (Streamable HTTP transport).
+    Serve {
+        /// Override the listen address (e.g. 127.0.0.1:3000).
+        #[arg(long)]
+        listen: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,12 +280,24 @@ enum InspectAction {
 }
 
 #[derive(Subcommand)]
+enum AuthAction {
+    /// Start the auth management server (OIDC endpoints).
+    Serve {
+        /// Override the listen address (e.g. 127.0.0.1:9082).
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// Show OIDC configuration and connectivity status.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum SessionAction {
     /// Create a new session.
     Create {
-        /// Operator name.
-        #[arg(long)]
-        operator: String,
+        /// Operator name (required unless --oidc is used).
+        #[arg(long, required_unless_present = "oidc")]
+        operator: Option<String>,
         /// Team.
         #[arg(long)]
         team: Option<String>,
@@ -280,6 +316,9 @@ enum SessionAction {
         /// Description.
         #[arg(long)]
         description: Option<String>,
+        /// Use OIDC browser authentication to create the session.
+        #[arg(long)]
+        oidc: bool,
     },
     /// List active sessions.
     List {
@@ -323,9 +362,14 @@ fn main() -> Result<()> {
         Commands::Ca { action } => match action {
             CaAction::Export => commands::ca::export(&cli.config),
             CaAction::Path => commands::ca::path(&cli.config),
+            CaAction::Install { yes } => commands::ca::install(&cli.config, yes),
+            CaAction::Uninstall { yes } => commands::ca::uninstall(&cli.config, yes),
         },
         Commands::Mcp { action } => match action {
             McpAction::Start => commands::mcp::start(&cli.config, cli.log_level.as_deref()),
+            McpAction::Serve { listen } => {
+                commands::mcp::serve(&cli.config, cli.log_level.as_deref(), listen.as_deref())
+            }
         },
         Commands::Policy { action } => match action {
             PolicyAction::Validate { path } => commands::policy::validate(&path),
@@ -392,6 +436,12 @@ fn main() -> Result<()> {
             }
             InspectAction::Rules { all, json } => commands::inspect::rules(&cli.config, all, json),
         },
+        Commands::Auth { action } => match action {
+            AuthAction::Serve { listen } => {
+                commands::auth::serve(&cli.config, cli.log_level.as_deref(), listen.as_deref())
+            }
+            AuthAction::Status => commands::auth::status(&cli.config),
+        },
         Commands::Session { action } => match action {
             SessionAction::Create {
                 operator,
@@ -401,16 +451,23 @@ fn main() -> Result<()> {
                 agent_type,
                 ttl,
                 description,
-            } => commands::session::create(
-                &cli.config,
-                &operator,
-                team.as_deref(),
-                project.as_deref(),
-                environment.as_deref(),
-                agent_type.as_deref(),
-                ttl,
-                description.as_deref(),
-            ),
+                oidc,
+            } => {
+                if oidc {
+                    commands::auth::session_create_oidc(&cli.config)
+                } else {
+                    commands::session::create(
+                        &cli.config,
+                        operator.as_deref().unwrap_or(""),
+                        team.as_deref(),
+                        project.as_deref(),
+                        environment.as_deref(),
+                        agent_type.as_deref(),
+                        ttl,
+                        description.as_deref(),
+                    )
+                }
+            }
             SessionAction::List { all, json } => commands::session::list(&cli.config, all, json),
             SessionAction::Revoke { id } => commands::session::revoke(&cli.config, &id),
             SessionAction::Inspect { id, json } => {
@@ -445,5 +502,124 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.is_empty());
         assert!(output.contains("bulwark"));
+    }
+
+    #[test]
+    fn ca_install_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "ca", "install", "--yes"]).unwrap();
+        match cli.command {
+            Commands::Ca {
+                action: CaAction::Install { yes },
+            } => assert!(yes),
+            _ => panic!("expected Ca Install"),
+        }
+    }
+
+    #[test]
+    fn ca_install_default_no_yes() {
+        let cli = Cli::try_parse_from(["bulwark", "ca", "install"]).unwrap();
+        match cli.command {
+            Commands::Ca {
+                action: CaAction::Install { yes },
+            } => assert!(!yes),
+            _ => panic!("expected Ca Install"),
+        }
+    }
+
+    #[test]
+    fn mcp_serve_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["bulwark", "mcp", "serve", "--listen", "0.0.0.0:4000"]).unwrap();
+        match cli.command {
+            Commands::Mcp {
+                action: McpAction::Serve { listen },
+            } => assert_eq!(listen.as_deref(), Some("0.0.0.0:4000")),
+            _ => panic!("expected Mcp Serve"),
+        }
+    }
+
+    #[test]
+    fn mcp_serve_default_no_listen() {
+        let cli = Cli::try_parse_from(["bulwark", "mcp", "serve"]).unwrap();
+        match cli.command {
+            Commands::Mcp {
+                action: McpAction::Serve { listen },
+            } => assert!(listen.is_none()),
+            _ => panic!("expected Mcp Serve"),
+        }
+    }
+
+    #[test]
+    fn ca_uninstall_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "ca", "uninstall", "-y"]).unwrap();
+        match cli.command {
+            Commands::Ca {
+                action: CaAction::Uninstall { yes },
+            } => assert!(yes),
+            _ => panic!("expected Ca Uninstall"),
+        }
+    }
+
+    #[test]
+    fn session_create_oidc_flag_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "session", "create", "--oidc"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Create { oidc, operator, .. },
+            } => {
+                assert!(oidc);
+                assert!(operator.is_none());
+            }
+            _ => panic!("expected Session Create with --oidc"),
+        }
+    }
+
+    #[test]
+    fn session_create_operator_still_works() {
+        let cli =
+            Cli::try_parse_from(["bulwark", "session", "create", "--operator", "alice"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Create { oidc, operator, .. },
+            } => {
+                assert!(!oidc);
+                assert_eq!(operator.as_deref(), Some("alice"));
+            }
+            _ => panic!("expected Session Create with --operator"),
+        }
+    }
+
+    #[test]
+    fn auth_serve_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "auth", "serve"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                action: AuthAction::Serve { listen },
+            } => assert!(listen.is_none()),
+            _ => panic!("expected Auth Serve"),
+        }
+    }
+
+    #[test]
+    fn auth_serve_with_listen_parses() {
+        let cli =
+            Cli::try_parse_from(["bulwark", "auth", "serve", "--listen", "0.0.0.0:9082"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                action: AuthAction::Serve { listen },
+            } => assert_eq!(listen.as_deref(), Some("0.0.0.0:9082")),
+            _ => panic!("expected Auth Serve"),
+        }
+    }
+
+    #[test]
+    fn auth_status_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bulwark", "auth", "status"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                action: AuthAction::Status,
+            } => {}
+            _ => panic!("expected Auth Status"),
+        }
     }
 }

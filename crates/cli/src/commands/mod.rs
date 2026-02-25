@@ -1,6 +1,7 @@
 //! CLI subcommand implementations.
 
 pub mod audit;
+pub mod auth;
 pub mod ca;
 pub mod cred;
 pub mod doctor;
