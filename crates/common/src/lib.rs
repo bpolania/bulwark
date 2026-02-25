@@ -45,6 +45,26 @@ pub enum BulwarkError {
     #[error("rate limit: {0}")]
     RateLimit(String),
 
+    /// OIDC discovery endpoint unreachable or invalid.
+    #[error("OIDC discovery failed: {0}")]
+    OidcDiscovery(String),
+
+    /// Authorization code exchange failed.
+    #[error("OIDC token exchange failed: {0}")]
+    OidcTokenExchange(String),
+
+    /// ID token validation failed (signature, expiry, issuer, etc.).
+    #[error("OIDC token validation failed: {0}")]
+    OidcTokenValidation(String),
+
+    /// Required claim missing or invalid.
+    #[error("OIDC claim extraction failed: {0}")]
+    OidcClaimExtraction(String),
+
+    /// Auth configuration invalid (bad issuer URL, missing client_id, etc.).
+    #[error("OIDC configuration error: {0}")]
+    OidcConfiguration(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

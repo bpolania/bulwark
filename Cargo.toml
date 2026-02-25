@@ -12,10 +12,11 @@ members = [
     "crates/mcp",
     "crates/ratelimit",
     "crates/inspect-http",
+    "crates/auth",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
@@ -32,6 +33,7 @@ bulwark-audit = { path = "crates/audit" }
 bulwark-inspect = { path = "crates/inspect" }
 bulwark-ratelimit = { path = "crates/ratelimit" }
 bulwark-inspect-http = { path = "crates/inspect-http" }
+bulwark-auth = { path = "crates/auth" }
 
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
